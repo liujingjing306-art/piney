@@ -6,7 +6,7 @@ use tauri::{command, AppHandle};
 /// 创建带有默认 User-Agent 的 HTTP 客户端
 fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
-        .user_agent("Piney/SillyTavern-Character-Card-Tools/0.2.9")
+        .user_agent("Piney/SillyTavern-Character-Card-Tools/0.3.0")
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }

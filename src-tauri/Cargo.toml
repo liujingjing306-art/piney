@@ -1,6 +1,6 @@
 [package]
 name = "piney-app"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Piney - SillyTavern 生态的全能角色卡工作站"
 authors = ["Piney Team"]
