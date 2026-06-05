@@ -24,6 +24,12 @@ pub struct LoginRequest {
     password: String,
 }
 
+#[derive(Deserialize)]
+pub struct RecoverRequest {
+    username: String,
+    password: String,
+}
+
 #[derive(Serialize)]
 pub struct LoginResponse {
     token: String,
@@ -144,6 +150,28 @@ async fn login(
     Ok(Json(LoginResponse { token }))
 }
 
+async fn recover(
+    State(config): State<ConfigState>,
+    Json(payload): Json<RecoverRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let username = payload.username.trim().to_string();
+    let password = payload.password;
+
+    if username.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "用户名不能为空".to_string()));
+    }
+
+    if password.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "密码不能为空".to_string()));
+    }
+
+    config
+        .save(username, password)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(Json("Credentials recovered"))
+}
+
 #[derive(Deserialize)]
 pub struct UpdateProfileRequest {
     pub current_password: String,
@@ -203,6 +231,7 @@ pub fn router(config: ConfigState) -> Router {
         .route("/status", get(get_status))
         .route("/setup", post(setup))
         .route("/login", post(login))
+        .route("/recover", post(recover))
         .route("/profile", post(update_profile))
         .with_state(config)
 }
