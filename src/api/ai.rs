@@ -1,9 +1,9 @@
 use crate::entities::{ai_channel, character_card, setting};
 use axum::{
+    Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
@@ -887,11 +887,15 @@ pub async fn execute_feature(
     let url = format!("{}/chat/completions", base);
 
     // 简化请求体，仅保留 OpenAI 兼容参数
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": channel.model_id,
         "messages": payload.messages,
-        "temperature": 0.7
+        "temperature": 0.7,
+        "max_tokens": 4096
     });
+    if payload.feature_id == "overview" {
+        body["response_format"] = serde_json::json!({ "type": "json_object" });
+    }
 
     // 调试日志：打印请求内容
 
@@ -1074,11 +1078,11 @@ pub async fn doctor_analyze(
         .get("first_mes")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let alt_greetings = v2_data
+    let alt_greetings: Vec<&str> = v2_data
         .get("alternate_greetings")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.first().and_then(|v| v.as_str()).unwrap_or(""))
-        .unwrap_or("");
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
 
     // 提取世界书目录
     let entries: Vec<Value> = v2_data
@@ -1116,17 +1120,39 @@ pub async fn doctor_analyze(
             && !content.trim().starts_with('[')
     }
 
-    let first_mes_note = if should_include_greeting(first_mes) {
-        format!("- 首条消息：{}", first_mes)
-    } else {
-        "- 首条消息：（内容过短或为代码，跳过诊断）".to_string()
-    };
+    fn clip_greeting(content: &str) -> String {
+        const MAX_CHARS: usize = 1200;
+        let mut out: String = content.chars().take(MAX_CHARS).collect();
+        if content.chars().count() > MAX_CHARS {
+            out.push_str("...");
+        }
+        out
+    }
 
-    let alt_greeting_note = if should_include_greeting(alt_greetings) {
-        format!("- 其他开场白（第1个）：{}", alt_greetings)
+    let mut greeting_notes = Vec::new();
+    if should_include_greeting(first_mes) {
+        greeting_notes.push(format!("- 首条消息：{}", clip_greeting(first_mes)));
     } else {
-        "- 其他开场白（第1个）：（内容过短或为代码，跳过诊断）".to_string()
-    };
+        greeting_notes.push("- 首条消息：（内容过短或为代码，跳过诊断）".to_string());
+    }
+
+    let usable_alt_greetings: Vec<&str> = alt_greetings
+        .into_iter()
+        .filter(|content| should_include_greeting(content))
+        .take(8)
+        .collect();
+    if usable_alt_greetings.is_empty() {
+        greeting_notes.push("- 其他开场白：（没有可诊断内容，或内容过短/为代码）".to_string());
+    } else {
+        for (idx, greeting) in usable_alt_greetings.iter().enumerate() {
+            greeting_notes.push(format!(
+                "- 其他开场白（第{}个）：{}",
+                idx + 1,
+                clip_greeting(greeting)
+            ));
+        }
+    }
+    let greeting_notes = greeting_notes.join("\n");
 
     // 构建 System Prompt (包含分析豁免声明)
     let system_prompt = format!(
@@ -1150,7 +1176,7 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
 **诊断重点：**
 - 专注于分析角色设定的逻辑一致性、人设合理性、对话质量
 - 不要诊断角色卡的格式问题（如标签格式、代码块使用等技术规范）
-- 开场白（first_mes 和其他开场白）是诊断的重要内容，确保不要遗漏
+- 开场白（first_mes 和其他开场白）是诊断的重要内容。用户可能配置多条 alternate_greetings；如果已提供多条，请综合比较，不要只诊断第一条。
 - **权重说明：** 核心设定（Name, Description, Personality）具有最高权重。世界书内容仅作为次要权重，但两者都很重要，都需要作为诊断的依据。
 
 **请求条目格式（严格 JSON，无代码块标记）：**
@@ -1184,14 +1210,13 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
 - 角色描述：{}
 - 性格特征：{}
 {}
-{}
 
 **世界书目录（条目名称列表）：**
 {}
 
 请返回 JSON 格式：{{"action": "request_entries", "entries": ["条目名1", ...]}}
 如果世界书目录为空或无需阅读条目，请直接输出诊断报告 JSON。请优先判断当前信息是否足够，避免不必要的搜索。同时请严格避开 NSFW 相关条目。"#,
-        name, description, personality, first_mes_note, alt_greeting_note, worldbook_toc_str
+        name, description, personality, greeting_notes, worldbook_toc_str
     );
 
     // 克隆需要的数据到 async 块

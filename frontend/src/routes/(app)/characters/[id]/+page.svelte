@@ -1188,13 +1188,11 @@
                                             />
                                             <span>AI 智能概览</span>
                                         </div>
-                                        <div
-                                            class="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity"
-                                        >
+                                        <div class="flex items-center gap-1">
                                             <Button
                                                 variant="ghost"
-                                                size="icon"
-                                                class="h-6 w-6 text-muted-foreground hover:text-foreground"
+                                                size="sm"
+                                                class="h-7 px-2 text-xs gap-1 text-muted-foreground hover:text-foreground"
                                                 title="重新生成"
                                                 disabled={isGeneratingOverview}
                                                 onclick={generateOverview}
@@ -1203,10 +1201,12 @@
                                                     <Loader2
                                                         class="h-3.5 w-3.5 animate-spin"
                                                     />
+                                                    生成中
                                                 {:else}
                                                     <Sparkles
                                                         class="h-3.5 w-3.5"
                                                     />
+                                                    重新生成
                                                 {/if}
                                             </Button>
                                         </div>

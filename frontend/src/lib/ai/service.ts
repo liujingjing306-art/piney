@@ -123,8 +123,15 @@ export class AiService {
             throw new Error("AI returned empty content");
         }
 
-        // 清理 markdown
-        const cleaned = content.replace(/```json/g, '').replace(/```/g, '').trim();
+        // 清理 markdown；部分兼容服务会无视 response_format，在 JSON 外加一句说明。
+        let cleaned = content.replace(/```json/g, '').replace(/```/g, '').trim();
+        if (!cleaned.startsWith('{')) {
+            const start = cleaned.indexOf('{');
+            const end = cleaned.lastIndexOf('}');
+            if (start >= 0 && end > start) {
+                cleaned = cleaned.slice(start, end + 1);
+            }
+        }
 
         try {
             return JSON.parse(cleaned);
@@ -650,4 +657,3 @@ export class AiService {
         }
     }
 }
-
