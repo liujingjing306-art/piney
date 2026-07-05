@@ -1212,11 +1212,32 @@
                                         </div>
                                     </div>
                                     {#if card.custom_summary}
-                                        <p
-                                            class="text-sm leading-relaxed text-muted-foreground/90 animate-in fade-in"
-                                        >
-                                            {card.custom_summary}
-                                        </p>
+                                        <div class="space-y-3 animate-in fade-in">
+                                            <p
+                                                class="text-sm leading-relaxed text-muted-foreground/90"
+                                            >
+                                                {card.custom_summary}
+                                            </p>
+                                            <Button
+                                                size="sm"
+                                                variant="secondary"
+                                                class="h-8 text-xs gap-2"
+                                                disabled={isGeneratingOverview}
+                                                onclick={generateOverview}
+                                            >
+                                                {#if isGeneratingOverview}
+                                                    <Loader2
+                                                        class="h-3.5 w-3.5 animate-spin"
+                                                    />
+                                                    生成中...
+                                                {:else}
+                                                    <Sparkles
+                                                        class="h-3.5 w-3.5"
+                                                    />
+                                                    重新生成概览
+                                                {/if}
+                                            </Button>
+                                        </div>
                                     {:else}
                                         <div
                                             class="text-center py-6 border border-dashed rounded-lg bg-background/50 flex flex-col items-center justify-center gap-3"
