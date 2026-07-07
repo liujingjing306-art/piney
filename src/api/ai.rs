@@ -886,12 +886,19 @@ pub async fn execute_feature(
     let base = channel.base_url.trim_end_matches('/');
     let url = format!("{}/chat/completions", base);
 
+    let max_tokens = match payload.feature_id.as_str() {
+        "generate_character" | "generate_opening" => 8192,
+        "optimize_description" | "optimize_first_mes" | "optimize_worldbook"
+        | "optimize_scenario" | "translate" => 8192,
+        _ => 4096,
+    };
+
     // 简化请求体，仅保留 OpenAI 兼容参数
     let mut body = serde_json::json!({
         "model": channel.model_id,
         "messages": payload.messages,
         "temperature": 0.7,
-        "max_tokens": 4096
+        "max_tokens": max_tokens
     });
     if payload.feature_id == "overview" {
         body["response_format"] = serde_json::json!({ "type": "json_object" });

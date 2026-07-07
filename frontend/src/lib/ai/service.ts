@@ -41,6 +41,18 @@ export class AiService {
         throw lastError;
     }
 
+    private static choiceContent(response: any): string {
+        const choice = response?.choices?.[0];
+        const content = choice?.message?.content || "";
+        if (choice?.finish_reason === "length") {
+            throw new Error("AI 输出被截断了（finish_reason=length）。请换更大输出上限的模型，或缩短输入后重试。");
+        }
+        if (!content) {
+            throw new Error("AI returned empty content");
+        }
+        return content;
+    }
+
     /**
      * 生成角色概览
      * @param card 角色卡数据
@@ -118,10 +130,7 @@ export class AiService {
         const response = await this.execute(AiFeature.OVERVIEW, messages, token);
 
         // 5. 解析响应内容
-        const content = response.choices?.[0]?.message?.content;
-        if (!content) {
-            throw new Error("AI returned empty content");
-        }
+        const content = this.choiceContent(response);
 
         // 清理 markdown；部分兼容服务会无视 response_format，在 JSON 外加一句说明。
         let cleaned = content.replace(/```json/g, '').replace(/```/g, '').trim();
@@ -191,10 +200,7 @@ export class AiService {
             const token = localStorage.getItem("auth_token");
             const response = await this.execute(feature, messages, token);
 
-            const content = response.choices?.[0]?.message?.content;
-            if (!content) {
-                throw new Error("AI returned empty content");
-            }
+            const content = this.choiceContent(response);
 
             // 清理可能存在的 Markdown 代码块包裹
             let cleaned = content.trim();
@@ -340,7 +346,7 @@ export class AiService {
 
             const token = localStorage.getItem("auth_token");
             const response = await this.execute(feature, messages, token);
-            let content = response.choices?.[0]?.message?.content || "";
+            let content = this.choiceContent(response);
 
             // 预处理：移除 <think>/<thinking>/<cot> 标签及其内容
             content = content.replace(/<think>[\s\S]*?<\/think>/gi, "");
@@ -406,7 +412,7 @@ export class AiService {
 
             const token = localStorage.getItem("auth_token");
             const response = await this.execute(feature, messages, token);
-            let content = response.choices?.[0]?.message?.content || "";
+            let content = this.choiceContent(response);
 
             // 预处理：移除 <think>/<thinking>/<cot> 标签及其内容
             content = content.replace(/<think>[\s\S]*?<\/think>/gi, "");
