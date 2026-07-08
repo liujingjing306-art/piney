@@ -953,6 +953,11 @@ use futures::stream::{self, Stream};
 use std::convert::Infallible;
 use std::time::Duration;
 
+const DOCTOR_MAX_ENTRY_ROUNDS: usize = 4;
+const DOCTOR_MAX_ENTRIES_PER_ROUND: usize = 4;
+const DOCTOR_GREETING_CHARS: usize = 2000;
+const DOCTOR_MAX_ALT_GREETINGS: usize = 12;
+
 #[derive(Deserialize)]
 pub struct DoctorAnalyzeRequest {
     pub card_id: Uuid,
@@ -1128,9 +1133,8 @@ pub async fn doctor_analyze(
     }
 
     fn clip_greeting(content: &str) -> String {
-        const MAX_CHARS: usize = 1200;
-        let mut out: String = content.chars().take(MAX_CHARS).collect();
-        if content.chars().count() > MAX_CHARS {
+        let mut out: String = content.chars().take(DOCTOR_GREETING_CHARS).collect();
+        if content.chars().count() > DOCTOR_GREETING_CHARS {
             out.push_str("...");
         }
         out
@@ -1146,7 +1150,7 @@ pub async fn doctor_analyze(
     let usable_alt_greetings: Vec<&str> = alt_greetings
         .into_iter()
         .filter(|content| should_include_greeting(content))
-        .take(8)
+        .take(DOCTOR_MAX_ALT_GREETINGS)
         .collect();
     if usable_alt_greetings.is_empty() {
         greeting_notes.push("- 其他开场白：（没有可诊断内容，或内容过短/为代码）".to_string());
@@ -1187,7 +1191,8 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
 - **权重说明：** 核心设定（Name, Description, Personality）具有最高权重。世界书内容仅作为次要权重，但两者都很重要，都需要作为诊断的依据。
 
 **请求条目格式（严格 JSON，无代码块标记）：**
-{{"action": "request_entries", "entries": ["条目名1", "条目名2"]}}
+{{"action": "request_entries", "entries": ["条目名1", "条目名2", "条目名3", "条目名4"]}}
+(注意：每轮最多申请 4 个条目。你可以连续申请多轮，系统会按需提供内容。)
 (注意：请勿申请可能包含极其露骨色情(NSFW)内容的条目，以免触发系统安全拦截导致任务失败)
 
 **诊断报告格式（严格 JSON，无代码块标记）：**
@@ -1255,7 +1260,7 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
             };
 
             // 如果已经完成或达到上限
-            if iteration > 2 {
+            if iteration > DOCTOR_MAX_ENTRY_ROUNDS {
                 return None;
             }
 
@@ -1267,7 +1272,8 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
             let body = serde_json::json!({
                 "model": channel.model_id,
                 "messages": messages,
-                "temperature": 0.7
+                "temperature": 0.7,
+                "max_tokens": 8192
             });
 
             let res = match client
@@ -1400,7 +1406,7 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
                 .and_then(|a| a.as_str())
                 .unwrap_or("final_report");
 
-            if action == "request_entries" && iteration < 2 {
+            if action == "request_entries" && iteration < DOCTOR_MAX_ENTRY_ROUNDS {
                 // AI 请求更多条目
                 let requested: Vec<String> = ai_response
                     .get("entries")
@@ -1408,6 +1414,7 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
                     .map(|arr| {
                         arr.iter()
                             .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .take(DOCTOR_MAX_ENTRIES_PER_ROUND)
                             .collect()
                     })
                     .unwrap_or_default();
@@ -1434,7 +1441,7 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
                 // 添加 AI 回复和新的用户消息
                 messages.push(serde_json::json!({"role": "assistant", "content": ai_content}));
 
-                let inject_msg = if iteration == 1 {
+                let inject_msg = if iteration + 1 >= DOCTOR_MAX_ENTRY_ROUNDS {
                     format!(
                         r#"**[系统指令：强制终审]** 这是最后一份补充内容：
 
@@ -1450,7 +1457,7 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
 {}
 
 **请决策：**
-- 如果需要更多信息，请返回 JSON：{{"action": "request_entries", "entries": ["新条目名1", ...]}}
+- 如果需要更多信息，请返回 JSON：{{"action": "request_entries", "entries": ["新条目名1", "新条目名2", "新条目名3", "新条目名4"]}}
 - 如果信息已足够，请按诊断报告格式输出 JSON。"#,
                         fetched_content
                     )
