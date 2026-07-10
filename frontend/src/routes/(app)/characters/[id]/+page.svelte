@@ -180,23 +180,25 @@
         }
 
         try {
-            const content = await AiService.generateOpening(
+            const result = await AiService.generateOpening(
                 card,
                 openingGenRequest,
                 openingWordCount,
                 worldInfoContext,
                 openingPersonType
             );
+            const content = result.content;
 
             // Insertion Logic
             if (!formFirstMes || !formFirstMes.trim()) {
                 formFirstMes = content;
-                toast.success("已生成并设置为主开场白");
+                if (!result.truncated) toast.success("已生成并设置为主开场白");
             } else {
                 if (!formAltGreetings) formAltGreetings = [];
                 formAltGreetings = [...formAltGreetings, content];
-                toast.success("已生成并添加到备选开场白列表");
+                if (!result.truncated) toast.success("已生成并添加到备选开场白列表");
             }
+            if (result.truncated) toast.warning("AI 输出达到上限，已保留开场白，请检查结尾后再保存");
             
             isGreetingsDirty = true; // Mark as dirty
             isOpeningGenDialogOpen = false;
@@ -262,13 +264,14 @@
         }
 
         try {
-            const content = await AiService.generateCharacter(
+            const result = await AiService.generateCharacter(
                 genInput,
                 genUseYaml,
                 worldInfoContext
             );
-            formDescription = content;
-            toast.success("角色生成完成");
+            formDescription = result.content;
+            if (result.truncated) toast.warning("AI 输出达到上限，已保留角色描述，请检查结尾后再保存");
+            else toast.success("角色生成完成");
             isGenDialogOpen = false;
         } catch (err: any) {
              toast.error("生成失败: " + (err.message || err));
