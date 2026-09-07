@@ -55,6 +55,7 @@
 
     // Default Assignments (Stored in settings)
     let configGlobal = $state("");
+    let configImage = $state("");
     let isSavingConfig = $state(false);
 
     // Prompt Configuration
@@ -101,6 +102,7 @@
                 // AI config is not yet in the backend Settings struct,
                 // so these will be undefined for now (feature pending backend update)
                 configGlobal = res.data.ai_config_global || "";
+                configImage = res.data.ai_config_image || "";
                 globalPrompt = res.data.global_prompt || "";
             }
         } catch (e) {
@@ -179,9 +181,11 @@
         isSavingConfig = true;
         try {
             // Update settings
-            await api.patch("/settings", {
+            const res = await api.patch("/settings", {
                 ai_config_global: configGlobal,
+                ai_config_image: configImage,
             });
+            if (!res.success) throw new Error(res.error || "保存失败");
             toast.success("默认模型配置已保存");
         } catch (e) {
             toast.error("保存配置失败", { description: String(e) });
@@ -541,6 +545,41 @@
                                             {@const selected = channels.find(
                                                 (c) => c.id === configGlobal,
                                             )}
+                                            {#if selected}
+                                                {selected.name} ({selected.model_id})
+                                            {:else}
+                                                <span class="text-muted-foreground">选择渠道...</span>
+                                            {/if}
+                                        {:else}
+                                            <span class="text-muted-foreground">选择渠道...</span>
+                                        {/if}
+                                    </SelectValue>
+                                </SelectTrigger>
+                                <SelectContent class="max-h-[40vh] overflow-y-auto">
+                                    <SelectItem value="" label="未配置">未配置</SelectItem>
+                                    {#each channels as c}
+                                        <SelectItem
+                                            value={c.id}
+                                            label={`${c.name} (${c.model_id})`}
+                                            disabled={!c.is_active}
+                                        >
+                                            {c.name} ({c.model_id})
+                                        </SelectItem>
+                                    {/each}
+                                </SelectContent>
+                            </Select>
+                        </div>
+                        <!-- 图库生图模型 -->
+                        <div class="space-y-2 min-w-0">
+                            <Label for="config-image">图库生图模型</Label>
+                            <p class="text-xs text-muted-foreground mb-2">
+                                图库 AI 生图和角色卡封面使用的 OpenAI-compatible 图片模型。
+                            </p>
+                            <Select type="single" bind:value={configImage}>
+                                <SelectTrigger id="config-image" class="w-full">
+                                    <SelectValue class="block truncate w-full">
+                                        {#if configImage}
+                                            {@const selected = channels.find((c) => c.id === configImage)}
                                             {#if selected}
                                                 {selected.name} ({selected.model_id})
                                             {:else}

@@ -991,6 +991,14 @@
                                         >
                                             <Upload class="mr-2 h-3 w-3" /> 更换封面
                                         </Button>
+                                        <Button
+                                            variant="outline"
+                                            size="sm"
+                                            class="bg-transparent text-white border-white/60 lg:border-white hover:bg-white hover:text-black h-8 text-xs"
+                                            onclick={() => goto(`/gallery?generate=${cardId}`)}
+                                        >
+                                            <Sparkles class="mr-2 h-3 w-3" /> AI 生成封面
+                                        </Button>
                                         <input
                                             type="file"
                                             bind:this={coverInput}

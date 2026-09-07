@@ -31,6 +31,8 @@ pub struct Settings {
     pub avatar: Option<String>,
     /// 全局 AI 默认渠道 ID
     pub ai_config_global: Option<String>,
+    /// 图库生图默认渠道 ID
+    pub ai_config_image: Option<String>,
     /// 全局提示词
     pub global_prompt: Option<String>,
 }
@@ -53,6 +55,7 @@ pub async fn get(State(db): State<DatabaseConnection>) -> Json<Settings> {
         items_per_page: 20,
         avatar: None,
         ai_config_global: None,
+        ai_config_image: None,
         global_prompt: None,
     };
 
@@ -69,6 +72,7 @@ pub async fn get(State(db): State<DatabaseConnection>) -> Json<Settings> {
             "items_per_page" => s.items_per_page = setting.value.parse().unwrap_or(20),
             "user_avatar" => s.avatar = Some(setting.value),
             "ai_config_global" => s.ai_config_global = Some(setting.value),
+            "ai_config_image" => s.ai_config_image = Some(setting.value),
             "global_prompt" => s.global_prompt = Some(setting.value),
             _ => {}
         }
@@ -102,6 +106,7 @@ pub async fn update(
                 "items_per_page" => "items_per_page",
                 "avatar" => "user_avatar", // Map 'avatar' to 'user_avatar'
                 "ai_config_global" => "ai_config_global",
+                "ai_config_image" => "ai_config_image",
                 "global_prompt" => "global_prompt",
                 _ => continue,
             };

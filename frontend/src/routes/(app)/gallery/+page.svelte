@@ -1,5 +1,6 @@
 <script lang="ts">
     import { onMount } from "svelte";
+    import { goto } from "$app/navigation";
     import { toast } from "svelte-sonner";
     import { cn } from "$lib/utils";
     import { Skeleton } from "$lib/components/ui/skeleton";
@@ -29,6 +30,8 @@
         Sparkles,
         Copy,
         CheckSquare,
+        Loader2,
+        Settings2,
     } from "lucide-svelte";
     import { Label } from "$lib/components/ui/label";
     import { dndzone, TRIGGERS } from "svelte-dnd-action";
@@ -36,6 +39,7 @@
     import { longpress } from "$lib/actions/longpress";
     import { downloadFile } from "$lib/utils/download";
     import { galleryUpload } from "$lib/stores/galleryUpload";
+    import { listNeedsRefresh } from "$lib/stores/cardCache";
 
     // ============ 类型定义 ============
     interface Category {
@@ -76,6 +80,19 @@
         is_favorite: boolean;
         user_notes: string | null;
         created_at: string;
+    }
+
+    interface AiChannel {
+        id: string;
+        name: string;
+        model_id: string;
+        is_active: boolean;
+    }
+
+    interface CharacterChoice {
+        id: string;
+        name: string;
+        avatar: string | null;
     }
 
     // ============ 颜色常量 ============
@@ -146,6 +163,21 @@
     let moveDialogOpen = $state(false);
     let targetCategoryId: string | null = $state(null);
     let isExporting = $state(false);
+
+    // AI 生图
+    let generationDialogOpen = $state(false);
+    let generationChannels = $state<AiChannel[]>([]);
+    let generationChannelId = $state("");
+    let generationCharacters = $state<CharacterChoice[]>([]);
+    let generationCharacterId = $state("");
+    let generationPrompt = $state("");
+    let generationNegativePrompt = $state("low quality, blurry, watermark, text, logo, malformed hands, distorted face");
+    let generationSize = $state("1024x1536");
+    let generationQuality = $state("auto");
+    let generationSetAsCover = $state(true);
+    let isGeneratingImage = $state(false);
+    let generatedImage = $state<ImageDetail | null>(null);
+    let promptDraftSource = $state<"appearance" | "description" | "">("");
 
 
     // ============ API 调用 ============
@@ -685,6 +717,150 @@
         input.value = "";
     }
 
+    const appearanceKeywords = /(?:外貌|外观|外形|长相|面容|五官|脸|发色|头发|发型|瞳|眼睛|眼眸|肤色|皮肤|身高|体型|身材|穿着|服装|衣着|特征|appearance|face|facial|hair|eyes?|height|build|body|skin|outfit|clothes?|wearing)/i;
+
+    function authHeaders(extra: Record<string, string> = {}) {
+        const token = localStorage.getItem("auth_token");
+        return { ...extra, ...(token ? { Authorization: `Bearer ${token}` } : {}) };
+    }
+
+    function characterCardData(raw: any) {
+        let root = raw;
+        if (typeof root === "string") {
+            try { root = JSON.parse(root); } catch { return {}; }
+        }
+        return root?.data && typeof root.data === "object" ? root.data : (root || {});
+    }
+
+    function buildCharacterCoverDraft(name: string, raw: any) {
+        const data = characterCardData(raw);
+        const source = [data.description, data.char_persona, data.personality]
+            .filter((value) => typeof value === "string" && value.trim())
+            .join("\n\n")
+            .trim();
+        const units = source
+            .split(/\n+/)
+            .flatMap((line: string) => line.match(/[^。！？.!?]+[。！？.!?]?/g) || [line])
+            .map((value: string) => value.trim())
+            .filter(Boolean);
+        const appearance = units.filter((value: string) => appearanceKeywords.test(value)).join("\n");
+        const detail = (appearance || source).slice(0, 3000);
+        promptDraftSource = appearance ? "appearance" : (source ? "description" : "");
+        return [
+            `角色卡封面，竖版 2:3 构图，单人角色 ${name}。`,
+            detail,
+            "清晰面部与上半身，人物是视觉中心，背景简洁但符合角色气质，不要文字、标题、Logo 或水印。",
+        ].filter(Boolean).join("\n\n");
+    }
+
+    async function loadGenerationContext() {
+        try {
+            const [channelsRes, settingsRes, cardsRes] = await Promise.all([
+                fetch(`${API_BASE}/api/ai/channels`, { headers: authHeaders() }),
+                fetch(`${API_BASE}/api/settings`, { headers: authHeaders() }),
+                fetch(`${API_BASE}/api/cards/all?page=1&page_size=100&sort=name&order=asc`, { headers: authHeaders() }),
+            ]);
+            if (channelsRes.ok) {
+                generationChannels = (await channelsRes.json()).filter((channel: AiChannel) => channel.is_active);
+            }
+            if (settingsRes.ok) {
+                const settings = await settingsRes.json();
+                generationChannelId = settings.ai_config_image || "";
+            }
+            if (cardsRes.ok) {
+                generationCharacters = (await cardsRes.json()).items || [];
+            }
+        } catch (e) {
+            console.error("加载生图配置失败", e);
+        }
+    }
+
+    async function fillPromptFromCharacter() {
+        generatedImage = null;
+        promptDraftSource = "";
+        if (!generationCharacterId) return;
+        try {
+            const res = await fetch(`${API_BASE}/api/cards/${generationCharacterId}`, { headers: authHeaders() });
+            if (!res.ok) throw new Error(await res.text());
+            const detail = await res.json();
+            const selected = generationCharacters.find((character) => character.id === generationCharacterId);
+            generationPrompt = buildCharacterCoverDraft(selected?.name || detail.name || "角色", detail.data);
+        } catch (e) {
+            toast.error("读取角色外貌失败", { description: String(e) });
+        }
+    }
+
+    async function openGenerationDialog(characterId = "") {
+        generatedImage = null;
+        generationDialogOpen = true;
+        if (!generationChannels.length || !generationCharacters.length) await loadGenerationContext();
+        if (characterId) {
+            generationCharacterId = characterId;
+            await fillPromptFromCharacter();
+        }
+    }
+
+    async function applyGeneratedCover(image: ImageDetail, characterId: string) {
+        const source = await fetch(resolveUrl(image.file_path), { headers: authHeaders() });
+        if (!source.ok) throw new Error("读取图库原图失败");
+        const form = new FormData();
+        form.append("file", await source.blob(), "generated-cover.png");
+        const response = await fetch(`${API_BASE}/api/cards/${characterId}/cover`, {
+            method: "POST",
+            headers: authHeaders(),
+            body: form,
+        });
+        if (!response.ok) throw new Error((await response.text()) || "设置角色封面失败");
+        listNeedsRefresh.set(true);
+    }
+
+    async function generateGalleryImage() {
+        if (!generationChannelId || !generationPrompt.trim() || isGeneratingImage) return;
+        isGeneratingImage = true;
+        generatedImage = null;
+        try {
+            const response = await fetch(`${API_BASE}/api/ai/images/generate`, {
+                method: "POST",
+                headers: authHeaders({ "Content-Type": "application/json" }),
+                body: JSON.stringify({
+                    channel_id: generationChannelId,
+                    prompt: generationPrompt.trim(),
+                    negative_prompt: generationNegativePrompt.trim() || null,
+                    size: generationSize,
+                    quality: generationQuality,
+                    character_id: generationCharacterId || null,
+                }),
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok) throw new Error(result.error || `生图失败 (${response.status})`);
+            generatedImage = result.image;
+
+            await fetch(`${API_BASE}/api/settings`, {
+                method: "PATCH",
+                headers: authHeaders({ "Content-Type": "application/json" }),
+                body: JSON.stringify({ ai_config_image: generationChannelId }),
+            });
+
+            let coverApplied = false;
+            if (generationCharacterId && generationSetAsCover) {
+                try {
+                    await applyGeneratedCover(result.image, generationCharacterId);
+                    coverApplied = true;
+                } catch (coverError) {
+                    toast.warning("图片已收入图库，但角色封面没有更新", { description: String(coverError) });
+                }
+            }
+            imageCache.clear();
+            currentPage = 1;
+            await fetchImages();
+            toast.success(coverApplied ? "图片已生成并设为角色封面" : "图片已生成并收入图库");
+        } catch (e: any) {
+            toast.error("生图失败", { description: e?.message || String(e) });
+        } finally {
+            isGeneratingImage = false;
+        }
+    }
+
     // ============ 拖拽排序 (svelte-dnd-action) ============
     function handleCategoryDndConsider(e: CustomEvent<{ items: Category[], info: { trigger: string } }>) {
         if (e.detail.info.trigger === TRIGGERS.DRAG_STARTED) {
@@ -805,7 +981,9 @@
     // ============ 生命周期 ============
     onMount(async () => {
         breadcrumbs.set([{ label: "图库" }]);
-        await Promise.all([fetchCategories(), fetchImages()]);
+        await Promise.all([fetchCategories(), fetchImages(), loadGenerationContext()]);
+        const requestedCharacter = new URLSearchParams(window.location.search).get("generate");
+        if (requestedCharacter) await openGenerationDialog(requestedCharacter);
         loading = false;
     });
 </script>
@@ -822,6 +1000,10 @@
             </p>
         </div>
         <div class="flex gap-2">
+            <Button variant="outline" class="gap-2" onclick={() => openGenerationDialog()}>
+                <Sparkles class="h-4 w-4" />
+                AI 生图
+            </Button>
             <input
                 type="file"
                 accept="image/png,image/jpeg,image/webp,image/gif"
@@ -1339,6 +1521,155 @@
         </div>
     {/if}
 </div>
+
+<!-- AI 生图对话框 -->
+<Dialog.Root bind:open={generationDialogOpen}>
+    <Dialog.Content class="!w-[95%] sm:!max-w-3xl max-h-[92vh] overflow-y-auto">
+        <Dialog.Header>
+            <Dialog.Title class="flex items-center gap-2">
+                <Sparkles class="h-5 w-5 text-primary" />
+                生成角色卡封面
+            </Dialog.Title>
+            <Dialog.Description>
+                从角色卡外貌起草，也可以完全自己写；生成结果会自动收入图库。
+            </Dialog.Description>
+        </Dialog.Header>
+
+        <div class="grid gap-5 py-3 md:grid-cols-[minmax(0,1fr)_220px]">
+            <div class="space-y-4 min-w-0">
+                <div class="space-y-2">
+                    <Label for="generation-channel">生图模型</Label>
+                    <select
+                        id="generation-channel"
+                        class="w-full h-10 px-3 rounded-md border bg-background text-sm"
+                        bind:value={generationChannelId}
+                    >
+                        <option value="">请选择已保存的 AI 渠道</option>
+                        {#each generationChannels as channel}
+                            <option value={channel.id}>{channel.name} · {channel.model_id}</option>
+                        {/each}
+                    </select>
+                    {#if !generationChannels.length}
+                        <button
+                            class="w-full rounded-md border border-dashed p-3 text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 flex items-center justify-center gap-2"
+                            onclick={() => goto("/settings")}
+                        >
+                            <Settings2 class="h-4 w-4" />
+                            先去设置添加 OpenAI-compatible 生图渠道
+                        </button>
+                    {/if}
+                </div>
+
+                <div class="space-y-2">
+                    <Label for="generation-character">用哪张角色卡起草外貌（可选）</Label>
+                    <select
+                        id="generation-character"
+                        class="w-full h-10 px-3 rounded-md border bg-background text-sm"
+                        bind:value={generationCharacterId}
+                        onchange={fillPromptFromCharacter}
+                    >
+                        <option value="">不关联角色，只生成到图库</option>
+                        {#each generationCharacters as character}
+                            <option value={character.id}>{character.name}</option>
+                        {/each}
+                    </select>
+                    {#if promptDraftSource}
+                        <p class="text-xs text-muted-foreground">
+                            {promptDraftSource === "appearance" ? "已优先摘出卡内的外貌相关句子。" : "卡内没有明确的外貌段落，已放入角色描述，请生成前删掉无关剧情。"}
+                        </p>
+                    {/if}
+                </div>
+
+                <div class="space-y-2">
+                    <Label for="generation-prompt">正向提示词</Label>
+                    <textarea
+                        id="generation-prompt"
+                        class="w-full min-h-[180px] px-3 py-2 rounded-md border bg-background resize-y text-sm leading-relaxed"
+                        bind:value={generationPrompt}
+                        placeholder="写下角色外貌、服装、姿势、构图、光线与画风……"
+                    ></textarea>
+                    <p class="text-xs text-muted-foreground">只有这里确认过的文字会发给生图渠道。</p>
+                </div>
+
+                <div class="space-y-2">
+                    <Label for="generation-negative">负向提示词（可选）</Label>
+                    <textarea
+                        id="generation-negative"
+                        class="w-full min-h-[76px] px-3 py-2 rounded-md border bg-background resize-y text-sm font-mono leading-relaxed"
+                        bind:value={generationNegativePrompt}
+                        placeholder="low quality, blurry, watermark..."
+                    ></textarea>
+                </div>
+
+                <div class="grid grid-cols-2 gap-3">
+                    <div class="space-y-2">
+                        <Label for="generation-size">尺寸</Label>
+                        <select id="generation-size" class="w-full h-10 px-3 rounded-md border bg-background text-sm" bind:value={generationSize}>
+                            <option value="1024x1536">1024 × 1536 · 封面</option>
+                            <option value="1024x1024">1024 × 1024 · 方图</option>
+                            <option value="1536x1024">1536 × 1024 · 横图</option>
+                        </select>
+                    </div>
+                    <div class="space-y-2">
+                        <Label for="generation-quality">质量</Label>
+                        <select id="generation-quality" class="w-full h-10 px-3 rounded-md border bg-background text-sm" bind:value={generationQuality}>
+                            <option value="auto">自动</option>
+                            <option value="high">高</option>
+                            <option value="medium">中</option>
+                            <option value="low">低</option>
+                        </select>
+                    </div>
+                </div>
+
+                {#if generationCharacterId}
+                    <label class="flex items-start gap-3 rounded-lg border p-3 cursor-pointer bg-muted/20">
+                        <input type="checkbox" class="mt-1 h-4 w-4" bind:checked={generationSetAsCover} />
+                        <span class="space-y-1">
+                            <strong class="block text-sm">生成后直接设为角色卡封面</strong>
+                            <small class="block text-muted-foreground">原图仍会留在图库；封面会按现有规则裁成 512 × 768。</small>
+                        </span>
+                    </label>
+                {/if}
+            </div>
+
+            <div class="rounded-xl border bg-muted/20 p-3 h-fit md:sticky md:top-0">
+                {#if generatedImage}
+                    <img
+                        src={resolveUrl(generatedImage.thumbnail_path)}
+                        alt={generatedImage.title}
+                        class="w-full aspect-[2/3] rounded-lg object-cover bg-muted"
+                    />
+                    <div class="mt-3 space-y-1">
+                        <strong class="text-sm block truncate">{generatedImage.title}</strong>
+                        <p class="text-xs text-muted-foreground">{generatedImage.width} × {generatedImage.height} · 已收入图库</p>
+                    </div>
+                {:else}
+                    <div class="aspect-[2/3] rounded-lg border border-dashed grid place-items-center text-center text-muted-foreground p-5">
+                        <div class="space-y-2">
+                            <Sparkles class="h-8 w-8 mx-auto opacity-50" />
+                            <p class="text-sm">成图会在这里预览</p>
+                        </div>
+                    </div>
+                {/if}
+            </div>
+        </div>
+
+        <Dialog.Footer class="gap-2 sm:gap-0">
+            <Button variant="outline" onclick={() => (generationDialogOpen = false)}>完成</Button>
+            <Button
+                class="gap-2"
+                disabled={!generationChannelId || !generationPrompt.trim() || isGeneratingImage}
+                onclick={generateGalleryImage}
+            >
+                {#if isGeneratingImage}
+                    <Loader2 class="h-4 w-4 animate-spin" /> 正在生成……
+                {:else}
+                    <Sparkles class="h-4 w-4" /> {generatedImage ? "按当前提示词再生成" : "生成图片"}
+                {/if}
+            </Button>
+        </Dialog.Footer>
+    </Dialog.Content>
+</Dialog.Root>
 
 <!-- 编辑对话框 -->
 <Dialog.Root bind:open={editDialogOpen}>

@@ -177,6 +177,7 @@ pub fn routes(db: DatabaseConnection, config: ConfigState) -> Router {
         )
         .route("/ai/test", post(ai::test_connection))
         .route("/ai/models", get(ai::list_models_proxy))
+        .route("/ai/images/generate", post(ai::generate_image))
         .route("/ai/card/overview", post(ai::generate_overview))
         .route("/ai/execute", post(ai::execute_feature))
         // 小皮医生

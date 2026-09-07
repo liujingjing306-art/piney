@@ -114,6 +114,131 @@ pub struct PaginatedResponse {
     pub total_pages: u64,
 }
 
+/// 将生图接口返回的图片直接收进图库，并保留生成参数。
+pub async fn store_generated_image(
+    db: &DatabaseConnection,
+    data: &[u8],
+    title: String,
+    platform: String,
+    prompt: String,
+    negative_prompt: Option<String>,
+    character_id: Option<Uuid>,
+) -> Result<ImageResponse, (StatusCode, Json<Value>)> {
+    const MAX_GENERATED_IMAGE_BYTES: usize = 25 * 1024 * 1024;
+    if data.is_empty() || data.len() > MAX_GENERATED_IMAGE_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "生图结果为空或超过 25MB" })),
+        ));
+    }
+
+    let format = image::guess_format(data).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("生图结果不是可识别的图片: {}", e) })),
+        )
+    })?;
+    let ext = match format {
+        image::ImageFormat::Png => "png",
+        image::ImageFormat::Jpeg => "jpg",
+        image::ImageFormat::WebP => "webp",
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "生图结果必须是 PNG、JPG 或 WebP" })),
+            ));
+        }
+    };
+    let img = image::load_from_memory(data).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("解析生图结果失败: {}", e) })),
+        )
+    })?;
+    let (width, height) = img.dimensions();
+    let id = Uuid::new_v4();
+    let storage_dir = crate::utils::paths::get_data_path("images").join(id.to_string());
+    fs::create_dir_all(&storage_dir).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("创建图片目录失败: {}", e) })),
+        )
+    })?;
+
+    let original_path = storage_dir.join(format!("original.{}", ext));
+    fs::write(&original_path, data).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("保存生图原图失败: {}", e) })),
+        )
+    })?;
+
+    let thumb = img.thumbnail(512, 768);
+    let webp_data = webp::Encoder::from_image(&thumb)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("生成缩略图失败: {}", e) })),
+            )
+        })?
+        .encode(85.0)
+        .to_vec();
+    fs::write(storage_dir.join("thumbnail.webp"), &webp_data)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("保存缩略图失败: {}", e) })),
+            )
+        })?;
+
+    let char_cards = character_id.map(|value| vec![value]).unwrap_or_default();
+    let new_image = image_entity::ActiveModel {
+        id: Set(id),
+        title: Set(title.trim().to_string()),
+        category_id: Set(None),
+        tags: Set("[]".to_string()),
+        file_path: Set(format!("/images/{}/original.{}", id, ext)),
+        thumbnail_path: Set(format!("/images/{}/thumbnail.webp", id)),
+        width: Set(width as i32),
+        height: Set(height as i32),
+        file_size: Set(data.len() as i64),
+        color_category: Set(Some(calculate_dominant_color(&img))),
+        is_ai: Set(true),
+        ai_platform: Set(Some(platform)),
+        ai_prompt: Set(Some(prompt)),
+        ai_negative_prompt: Set(negative_prompt.filter(|value| !value.trim().is_empty())),
+        is_authorized: Set(false),
+        is_favorite: Set(false),
+        user_notes: Set(None),
+        char_cards: Set(serde_json::to_string(&char_cards).unwrap_or_else(|_| "[]".to_string())),
+        created_at: Set(Utc::now().naive_utc()),
+    };
+    new_image.insert(db).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("保存生图记录失败: {}", e) })),
+        )
+    })?;
+
+    let saved = image_entity::Entity::find_by_id(id)
+        .one(db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("读取生图记录失败: {}", e) })),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": "生图已经保存，但图库记录没有找到" })),
+            )
+        })?;
+    Ok(ImageResponse::from(saved))
+}
+
 impl From<image_entity::Model> for ImageResponse {
     fn from(m: image_entity::Model) -> Self {
         let tags: Vec<String> = serde_json::from_str(&m.tags).unwrap_or_default();

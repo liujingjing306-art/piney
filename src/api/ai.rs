@@ -1,4 +1,5 @@
 use crate::entities::{ai_channel, character_card, setting};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use axum::{
     Json,
     extract::{Path, State},
@@ -32,6 +33,284 @@ fn http_client() -> reqwest::Client {
         .user_agent("Piney/SillyTavern-Character-Card-Tools/0.3.0")
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn image_endpoint_candidates(base_url: &str) -> Vec<String> {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/images/generations") || base.ends_with("/images") {
+        return vec![base.to_string()];
+    }
+
+    // OpenAI/Gemini compatibility uses /images/generations, while OpenRouter's
+    // dedicated image API uses /images. Prefer the provider's native route and
+    // retain the other OpenAI-compatible shape as a safe 404/405 fallback.
+    if base.contains("openrouter.ai") {
+        vec![format!("{}/images", base), format!("{}/images/generations", base)]
+    } else {
+        vec![format!("{}/images/generations", base), format!("{}/images", base)]
+    }
+}
+
+#[derive(Deserialize)]
+pub struct GenerateImageRequest {
+    pub channel_id: Option<Uuid>,
+    pub prompt: String,
+    pub negative_prompt: Option<String>,
+    pub size: Option<String>,
+    pub quality: Option<String>,
+    pub character_id: Option<Uuid>,
+}
+
+#[derive(Serialize)]
+pub struct GenerateImageResponse {
+    pub image: crate::api::images::ImageResponse,
+    pub revised_prompt: Option<String>,
+    pub channel_name: String,
+    pub model_id: String,
+}
+
+/// POST /api/ai/images/generate - 使用已保存的 OpenAI-compatible 渠道生成图片并收入图库
+pub async fn generate_image(
+    State(db): State<DatabaseConnection>,
+    Json(payload): Json<GenerateImageRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
+    let prompt = payload.prompt.trim();
+    if prompt.is_empty() || prompt.chars().count() > 12_000 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "提示词不能为空且不能超过 12000 字"})),
+        ));
+    }
+
+    let channel_id = match payload.channel_id {
+        Some(id) => id,
+        None => {
+            let configured = setting::Entity::find_by_id("ai_config_image")
+                .one(&db)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                })?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": "请先在系统设置里指定图库生图模型"})),
+                    )
+                })?;
+            Uuid::parse_str(&configured.value).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "图库生图模型配置已经失效，请重新选择"})),
+                )
+            })?
+        }
+    };
+
+    let channel = ai_channel::Entity::find_by_id(channel_id)
+        .one(&db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        })?
+        .filter(|item| item.is_active)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "选择的生图渠道不存在或已停用"})),
+            )
+        })?;
+
+    let character_name = if let Some(character_id) = payload.character_id {
+        Some(
+            character_card::Entity::find_by_id(character_id)
+                .one(&db)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": e.to_string()})),
+                    )
+                })?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"error": "要设置封面的角色卡不存在"})),
+                    )
+                })?
+                .name,
+        )
+    } else {
+        None
+    };
+
+    let negative_prompt = payload
+        .negative_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let provider_prompt = match negative_prompt {
+        Some(negative) => format!("{}\n\nNegative prompt: {}", prompt, negative),
+        None => prompt.to_string(),
+    };
+    let size = payload.size.as_deref().unwrap_or("1024x1536").trim();
+    if size.len() > 32 || !size.chars().all(|char| char.is_ascii_alphanumeric() || char == 'x' || char == '-') {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "图片尺寸格式不正确"})),
+        ));
+    }
+
+    let mut body = serde_json::json!({
+        "model": channel.model_id,
+        "prompt": provider_prompt,
+        "n": 1,
+        "size": size,
+        "response_format": "b64_json"
+    });
+    if let Some(quality) = payload.quality.as_deref().map(str::trim).filter(|value| !value.is_empty() && *value != "auto") {
+        body["quality"] = Value::String(quality.to_string());
+    }
+
+    let client = http_client();
+    let send = |url: &str, request_body: &Value| {
+        client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", channel.api_key))
+            .header("Content-Type", "application/json")
+            .json(request_body)
+            .send()
+    };
+
+    let endpoints = image_endpoint_candidates(&channel.base_url);
+    let mut response_and_url = None;
+    for (index, url) in endpoints.iter().enumerate() {
+        let current = send(url, &body).await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("生图渠道连接失败: {}", e)})),
+            )
+        })?;
+        if matches!(current.status().as_u16(), 404 | 405) && index + 1 < endpoints.len() {
+            continue;
+        }
+        response_and_url = Some((current, url));
+        break;
+    }
+    let (mut response, used_url) =
+        response_and_url.expect("image endpoint candidates are never empty");
+
+    if matches!(response.status().as_u16(), 400 | 422) && body.get("response_format").is_some() {
+        body.as_object_mut()
+            .map(|object| object.remove("response_format"));
+        response = send(used_url, &body).await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("生图渠道连接失败: {}", e)})),
+            )
+        })?;
+    }
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        let detail = response.text().await.unwrap_or_default();
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("生图渠道返回 {}: {}", status, detail)})),
+        ));
+    }
+
+    let response_json: Value = response.json().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("生图渠道没有返回有效 JSON: {}", e)})),
+        )
+    })?;
+    let item = response_json
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": "生图渠道没有返回图片"})),
+            )
+        })?;
+
+    let image_bytes = if let Some(encoded) = item.get("b64_json").and_then(Value::as_str) {
+        let clean = encoded.rsplit_once(',').map(|(_, value)| value).unwrap_or(encoded);
+        BASE64_STANDARD.decode(clean).map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("生图渠道返回了损坏的图片数据: {}", e)})),
+            )
+        })?
+    } else if let Some(image_url) = item.get("url").and_then(Value::as_str) {
+        let parsed = reqwest::Url::parse(image_url).map_err(|_| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": "生图渠道返回的图片地址无效"})),
+            )
+        })?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": "生图渠道返回的图片地址不是 HTTP(S)"})),
+            ));
+        }
+        let download = client.get(parsed).send().await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("下载生成图片失败: {}", e)})),
+            )
+        })?;
+        if !download.status().is_success() {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("下载生成图片失败 ({})", download.status())})),
+            ));
+        }
+        download.bytes().await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("读取生成图片失败: {}", e)})),
+            )
+        })?.to_vec()
+    } else {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": "生图渠道既没有返回 b64_json，也没有返回图片 URL"})),
+        ));
+    };
+
+    let title = character_name
+        .as_deref()
+        .map(|name| format!("{} AI 封面", name))
+        .unwrap_or_else(|| format!("AI 生图 {}", chrono::Local::now().format("%Y%m%d-%H%M")));
+    let saved = crate::api::images::store_generated_image(
+        &db,
+        &image_bytes,
+        title,
+        channel.name.clone(),
+        prompt.to_string(),
+        negative_prompt.map(str::to_string),
+        payload.character_id,
+    )
+    .await?;
+
+    Ok(Json(GenerateImageResponse {
+        image: saved,
+        revised_prompt: item
+            .get("revised_prompt")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        channel_name: channel.name,
+        model_id: channel.model_id,
+    }))
 }
 
 #[derive(Serialize)]
@@ -1616,4 +1895,43 @@ pub async fn doctor_history_delete(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod image_generation_tests {
+    use super::image_endpoint_candidates;
+
+    #[test]
+    fn uses_openai_compatible_generation_endpoint_by_default() {
+        assert_eq!(
+            image_endpoint_candidates("https://api.example.com/v1/"),
+            vec![
+                "https://api.example.com/v1/images/generations",
+                "https://api.example.com/v1/images",
+            ]
+        );
+    }
+
+    #[test]
+    fn prefers_openrouter_dedicated_image_endpoint() {
+        assert_eq!(
+            image_endpoint_candidates("https://openrouter.ai/api/v1"),
+            vec![
+                "https://openrouter.ai/api/v1/images",
+                "https://openrouter.ai/api/v1/images/generations",
+            ]
+        );
+    }
+
+    #[test]
+    fn respects_an_explicit_image_endpoint() {
+        assert_eq!(
+            image_endpoint_candidates("https://example.com/custom/images/generations/"),
+            vec!["https://example.com/custom/images/generations"]
+        );
+        assert_eq!(
+            image_endpoint_candidates("https://example.com/custom/images"),
+            vec!["https://example.com/custom/images"]
+        );
+    }
 }
