@@ -4,6 +4,11 @@ import { CHAR_GEN_NO_YAML, CHAR_GEN_YAML, PRESET_STUDY_PROMPT } from './template
 import { AiFeature, type PromptVariables } from './types';
 
 export type AiTextResult = { content: string; truncated: boolean };
+export type GeneratedWorldInfoEntry = {
+    comment: string;
+    content: string;
+    keys: string[];
+};
 
 export class AiService {
     private static activeRequests = 0;
@@ -257,14 +262,17 @@ export class AiService {
      */
     static async generateWorldInfo(
         userInput: string,
-        currentWorldInfo: string
-    ): Promise<any[]> {
+        currentWorldInfo: string,
+        entryCount = 3
+    ): Promise<GeneratedWorldInfoEntry[]> {
+        const normalizedEntryCount = Math.min(8, Math.max(1, Math.round(entryCount)));
         const globalPrompt = await this.getGlobalPrompt();
         const feature = AiFeature.GENERATE_WORLD_INFO;
 
         const variables: any = {
             user_request: userInput,
             current_world_info: currentWorldInfo,
+            entry_count: String(normalizedEntryCount),
             name: "", description: "", personality: "", first_mes: "", creator_notes: ""
         };
 
@@ -293,8 +301,30 @@ export class AiService {
             }
 
             try {
-                return JSON.parse(content);
+                const parsed = JSON.parse(content);
+                if (!Array.isArray(parsed)) {
+                    throw new Error("生成结果不是条目数组");
+                }
+
+                return parsed
+                    .map((item: any) => {
+                        const rawKeys = item?.keys ?? item?.key ?? [];
+                        const keys = Array.isArray(rawKeys)
+                            ? rawKeys
+                            : String(rawKeys || "").split(/[,，、\n]/);
+
+                        return {
+                            comment: String(item?.comment || item?.name || "").trim(),
+                            content: String(item?.content || "").trim(),
+                            keys: keys.map((key: any) => String(key).trim()).filter(Boolean),
+                        };
+                    })
+                    .filter((item: GeneratedWorldInfoEntry) => item.comment || item.content)
+                    .slice(0, normalizedEntryCount);
             } catch (e) {
+                if (e instanceof Error && e.message === "生成结果不是条目数组") {
+                    throw e;
+                }
                 throw new Error("生成内容无法解析为JSON");
             }
         } catch (e: any) {

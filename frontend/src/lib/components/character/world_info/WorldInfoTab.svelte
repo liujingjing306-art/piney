@@ -3,14 +3,13 @@
     import DirtyInput from "$lib/components/common/DirtyInput.svelte";
     import { Button } from "$lib/components/ui/button";
     import { Label } from "$lib/components/ui/label";
-    import { Plus, Globe, Search, ArrowUpDown, Download, ChevronDown, FileDown, FileUp, MoreHorizontal, Bot, Sparkles, Loader2 } from "lucide-svelte";
+    import { Plus, Search, Download, FileDown, FileUp, MoreHorizontal, Bot, Sparkles, Loader2, Lightbulb, WandSparkles, X } from "lucide-svelte";
     import { toast } from "svelte-sonner";
-    import { AiFeature } from "$lib/ai/types";
     import { AiService } from "$lib/ai/service";
     import * as Dialog from "$lib/components/ui/dialog";
     import { Textarea } from "$lib/components/ui/textarea";
+    import { Checkbox } from "$lib/components/ui/checkbox";
     import WorldInfoEntry from "./WorldInfoEntry.svelte";
-    import { ScrollArea } from "$lib/components/ui/scroll-area";
     import { cn } from "$lib/utils";
     import * as DropdownMenu from "$lib/components/ui/dropdown-menu";
     import ImportWorldInfoDialog from "./ImportWorldInfoDialog.svelte";
@@ -464,52 +463,88 @@
     }
 
     // AI Generation Logic
+    type GenerationMode = "keywords" | "inspire";
+    type GeneratedDraft = {
+        comment: string;
+        content: string;
+        keysText: string;
+        selected: boolean;
+    };
+
     let isGenDialogOpen = $state(false);
-    let genInput = $state("");
+    let genMode: GenerationMode = $state("keywords");
+    let genKeywords = $state("");
+    let genCount = $state(3);
     let isGenerating = $state(false);
+    let generatedDrafts: GeneratedDraft[] = $state([]);
+
+    function openGenerator() {
+        generatedDrafts = [];
+        isGenDialogOpen = true;
+    }
+
+    function getCurrentWorldInfo() {
+        let entriesData: any[] = [];
+        if (Array.isArray(data.character_book?.entries)) {
+            entriesData = data.character_book.entries;
+        } else {
+            entriesData = Object.values(data.character_book?.entries || {});
+        }
+
+        const context = entriesData
+            .filter((entry: any) => entry.enabled !== false && entry.disable !== true)
+            .map((entry: any) => {
+                const keys = entry.keys || entry.key || [];
+                return `名称：${entry.comment || "未命名"}\n关键词：${Array.isArray(keys) ? keys.join("、") : keys}\n内容：${entry.content || ""}`;
+            })
+            .join("\n---\n");
+
+        // Keep large imported books within a practical request size while retaining recent context.
+        return context.length > 16000 ? context.slice(-16000) : context;
+    }
+
+    function buildGenerationRequest(count: number, hasContext: boolean) {
+        const worldName = (mode === "global" ? name : data.extensions?.world) || "未命名世界";
+        if (genMode === "keywords") {
+            return `为《${worldName}》围绕以下关键词或设定锚点生成 ${count} 条彼此有关联、可直接使用的世界书条目：${genKeywords.trim()}。不要重复当前已有条目。`;
+        }
+
+        if (hasContext) {
+            return `为《${worldName}》一键补全 ${count} 条当前世界观中最缺失、最能产生剧情钩子的世界书条目。新条目必须与已有设定相互引用，且不要重复已有条目。`;
+        }
+
+        return `为《${worldName}》原创 ${count} 条相互关联的基础世界书条目，覆盖地点、势力、人物或物件中的合适组合，并留下可继续扩展的剧情钩子。`;
+    }
 
     async function handleGenerateWorldInfo() {
-        if (!genInput.trim()) {
-            toast.error("请输入描述内容");
+        if (genMode === "keywords" && !genKeywords.trim()) {
+            toast.error("先输入几个关键词或设定锚点吧");
             return;
         }
-        
+
+        const count = Math.min(8, Math.max(1, Math.round(Number(genCount) || 3)));
+        genCount = count;
         isGenerating = true;
 
         try {
-            // Build Context
-            let entriesData = [];
-            if (Array.isArray(data.character_book?.entries)) {
-                entriesData = data.character_book.entries;
+            const currentWorldInfo = getCurrentWorldInfo();
+            const request = buildGenerationRequest(count, Boolean(currentWorldInfo));
+            const newEntriesData = await AiService.generateWorldInfo(
+                request,
+                currentWorldInfo || "（当前世界书暂无条目）",
+                count,
+            );
+
+            if (newEntriesData.length > 0) {
+                generatedDrafts = newEntriesData.map((item, index) => ({
+                    comment: item.comment || `AI 生成条目 ${index + 1}`,
+                    content: item.content || "",
+                    keysText: item.keys.join("、"),
+                    selected: true,
+                }));
+                toast.success(`生成了 ${generatedDrafts.length} 条，确认后再加入世界书`);
             } else {
-                entriesData = Object.values(data.character_book?.entries || {});
-            }
-            
-            const enabledEntries = entriesData.filter((e: any) => e.enabled !== false && e.disable !== true);
-            const currentWorldInfo = enabledEntries.map((e: any) => {
-                return `Name: ${e.comment}\nContent: ${e.content}`;
-            }).join("\n---\n");
-            
-            const newEntriesData = await AiService.generateWorldInfo(genInput, currentWorldInfo);
-            
-            if (newEntriesData && Array.isArray(newEntriesData)) {
-                let count = 0;
-                newEntriesData.forEach(item => {
-                    addEntry({
-                        comment: item.comment || "AI生成条目",
-                        content: item.content || "",
-                        constant: true
-                    });
-                    count++;
-                });
-                
-                // Success
-                toast.success(`已生成 ${count} 个条目`);
-                isGenDialogOpen = false;
-                genInput = "";
-                
-            } else {
-                 toast.error("生成格式异常: 结果不是数组");
+                toast.error("AI 没有返回可用条目，请换个关键词重试");
             }
         } catch (e: any) {
             toast.error("生成失败: " + (e.message || "Unknown error"));
@@ -518,13 +553,39 @@
         }
     }
 
+    function addGeneratedEntries() {
+        const selected = generatedDrafts.filter((draft) => draft.selected);
+        if (selected.length === 0) {
+            toast.error("至少选择一条再加入世界书");
+            return;
+        }
+
+        selected.forEach((draft) => {
+            const keys = draft.keysText
+                .split(/[,，、\n]/)
+                .map((key) => key.trim())
+                .filter(Boolean);
+            addEntry({
+                comment: draft.comment.trim() || "AI 生成条目",
+                content: draft.content.trim(),
+                ...(mode === "global" ? { key: keys } : { keys }),
+                constant: keys.length === 0,
+            });
+        });
+
+        toast.success(`已加入 ${selected.length} 条，记得保存世界书`);
+        isGenDialogOpen = false;
+        generatedDrafts = [];
+        genKeywords = "";
+    }
+
 </script>
 
 <div
     class="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500 pb-10"
 >
     <!-- Entries Toolbar -->
-    <div class="flex items-center gap-4">
+    <div class="flex flex-wrap items-center gap-4">
         <div class="relative flex-1 ml-1 border border-1 rounded-md">
             <Search
                 class="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground"
@@ -550,15 +611,17 @@
                             <FileUp class="mr-2 h-4 w-4" />
                             导出到全局世界书...
                         </DropdownMenu.Item>
-                        {#if source === "local"}
-                            <DropdownMenu.Separator />
-                             <DropdownMenu.Item onclick={() => isGenDialogOpen = true}>
-                                <Bot class="mr-2 h-4 w-4" />
-                                AI 生成条目...
-                            </DropdownMenu.Item>
-                        {/if}
                     </DropdownMenu.Content>
                 </DropdownMenu.Root>
+            {/if}
+            {#if source === "local"}
+                <Button
+                    onclick={openGenerator}
+                    class="gap-2 border-primary/30 bg-primary/5 text-foreground hover:bg-primary/10"
+                    variant="outline"
+                >
+                    <WandSparkles class="h-4 w-4 text-primary" /> AI 生成
+                </Button>
             {/if}
             <Button
                 onclick={addEntry}
@@ -743,42 +806,138 @@
     />
 
     <Dialog.Root bind:open={isGenDialogOpen}>
-        <Dialog.Content class="sm:max-w-[500px]">
+        <Dialog.Content class="sm:max-w-[720px] max-h-[90vh] overflow-y-auto">
             <Dialog.Header>
                 <Dialog.Title class="flex items-center gap-2">
                     <Bot class="h-5 w-5 text-primary" />
                     AI 世界书生成
                 </Dialog.Title>
                 <Dialog.Description>
-                    输入设定灵感，AI 将基于当前世界观自动扩展相关条目。
+                    用关键词定向创作，或让 AI 基于现有设定一键补全几条。
                 </Dialog.Description>
                 <div class="text-xs text-orange-600 dark:text-orange-400 mt-1">
-                    条目确认使用后，请记得点保存，否则在下次生成时，之前生成的内容不会作为上下文。
+                    生成结果会先进入预览，不会直接改动世界书。
                 </div>
             </Dialog.Header>
-            
-            <div class="py-4">
-                <Label class="mb-2 block">设定描述</Label>
-                <Textarea 
-                    bind:value={genInput} 
-                    placeholder="请清晰描述你想要的世界书方向和简要内容，并且建议进行限制（免得AI放飞自我）"
-                    rows={4}
-                />
+
+            <div class="space-y-5 py-4">
+                <div class="grid grid-cols-2 gap-2 rounded-lg bg-muted/50 p-1">
+                    <Button
+                        type="button"
+                        variant={genMode === "keywords" ? "default" : "ghost"}
+                        class="gap-2"
+                        onclick={() => { genMode = "keywords"; generatedDrafts = []; }}
+                    >
+                        <Sparkles class="h-4 w-4" /> 关键词生成
+                    </Button>
+                    <Button
+                        type="button"
+                        variant={genMode === "inspire" ? "default" : "ghost"}
+                        class="gap-2"
+                        onclick={() => { genMode = "inspire"; generatedDrafts = []; }}
+                    >
+                        <Lightbulb class="h-4 w-4" /> 一键补全
+                    </Button>
+                </div>
+
+                {#if genMode === "keywords"}
+                    <div class="space-y-2">
+                        <Label for="world-info-keywords">关键词 / 设定锚点</Label>
+                        <Textarea
+                            id="world-info-keywords"
+                            bind:value={genKeywords}
+                            placeholder="例如：海上城邦、禁忌潮汐、以记忆缴税、失踪的灯塔守卫"
+                            rows={3}
+                        />
+                        <p class="text-xs text-muted-foreground">可以只写几个词，也可以补充时代、风格和不想出现的内容。</p>
+                    </div>
+                {:else}
+                    <div class="rounded-lg border border-dashed bg-muted/20 p-4 text-sm text-muted-foreground">
+                        {#if getCurrentWorldInfo()}
+                            AI 会阅读当前已启用的条目，挑出设定缺口并补充彼此关联的新条目。
+                        {:else}
+                            当前世界书还是空的，AI 会从世界书名称出发，先搭一组相互关联的基础设定。
+                        {/if}
+                    </div>
+                {/if}
+
+                <div class="flex items-center justify-between gap-4">
+                    <div>
+                        <Label for="world-info-count">生成条数</Label>
+                        <p class="text-xs text-muted-foreground mt-1">一次 1–8 条，只调用一次模型。</p>
+                    </div>
+                    <Input
+                        id="world-info-count"
+                        type="number"
+                        min="1"
+                        max="8"
+                        step="1"
+                        bind:value={genCount}
+                        class="w-20 text-center"
+                    />
+                </div>
+
+                {#if generatedDrafts.length > 0}
+                    <div class="space-y-3 border-t pt-4">
+                        <div class="flex items-center justify-between">
+                            <Label>生成预览</Label>
+                            <span class="text-xs text-muted-foreground">可编辑、可取消勾选</span>
+                        </div>
+                        {#each generatedDrafts as draft, index}
+                            <div class="rounded-xl border bg-card p-4 space-y-3">
+                                <div class="flex items-start gap-3">
+                                    <Checkbox
+                                        aria-label={`选择第 ${index + 1} 条`}
+                                        bind:checked={draft.selected}
+                                        class="mt-2"
+                                    />
+                                    <div class="grid flex-1 gap-3 sm:grid-cols-2">
+                                        <div class="space-y-1.5">
+                                            <Label for={`generated-entry-name-${index}`}>条目名称</Label>
+                                            <Input id={`generated-entry-name-${index}`} bind:value={draft.comment} />
+                                        </div>
+                                        <div class="space-y-1.5">
+                                            <Label for={`generated-entry-keys-${index}`}>触发关键词</Label>
+                                            <Input id={`generated-entry-keys-${index}`} bind:value={draft.keysText} placeholder="用逗号或顿号分隔" />
+                                        </div>
+                                    </div>
+                                    <Button
+                                        type="button"
+                                        variant="ghost"
+                                        size="icon"
+                                        aria-label={`移除第 ${index + 1} 条`}
+                                        onclick={() => generatedDrafts = generatedDrafts.filter((_, i) => i !== index)}
+                                    >
+                                        <X class="h-4 w-4" />
+                                    </Button>
+                                </div>
+                                <div class="space-y-1.5 pl-8">
+                                    <Label for={`generated-entry-content-${index}`}>条目内容</Label>
+                                    <Textarea id={`generated-entry-content-${index}`} bind:value={draft.content} rows={5} />
+                                </div>
+                            </div>
+                        {/each}
+                    </div>
+                {/if}
             </div>
 
             <Dialog.Footer>
                 <Button variant="outline" onclick={() => isGenDialogOpen = false}>取消</Button>
-                <Button onclick={handleGenerateWorldInfo} disabled={isGenerating}>
+                <Button variant={generatedDrafts.length > 0 ? "outline" : "default"} onclick={handleGenerateWorldInfo} disabled={isGenerating}>
                     {#if isGenerating}
                         <Loader2 class="mr-2 h-4 w-4 animate-spin" />
                         生成中，别关...
                     {:else}
                         <Sparkles class="mr-2 h-4 w-4" />
-                        开始生成
+                        {generatedDrafts.length > 0 ? "重新生成" : "开始生成"}
                     {/if}
                 </Button>
+                {#if generatedDrafts.length > 0}
+                    <Button onclick={addGeneratedEntries} disabled={!generatedDrafts.some((draft) => draft.selected)}>
+                        <Plus class="mr-2 h-4 w-4" />
+                        加入世界书（{generatedDrafts.filter((draft) => draft.selected).length}）
+                    </Button>
+                {/if}
             </Dialog.Footer>
         </Dialog.Content>
     </Dialog.Root>
-
-

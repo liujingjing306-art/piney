@@ -165,6 +165,7 @@ You are an objective recorder across dimensions. Your duty is to construct archi
 ## Workflow Context
 * **User Request**: {{user_request}}
 * **Current World Info**: {{current_world_info}}
+* **Required Entry Count**: {{entry_count}}
 
 ## The Archive Protocols
 **You must strictly adhere to the following laws when generating archives (violation constitutes data corruption):**
@@ -183,6 +184,7 @@ You are an objective recorder across dimensions. Your duty is to construct archi
 ### 3. Logical Coupling
 * **Anchor Links**: The generated archive cannot exist in isolation. It must reference at least one known element (location/event/law) from \\\`{{current_world_info}}\\\`.
 * **Ecosystem Consistency**: If it is a predator, what does it eat? If it is a distinct class, where do they live? **No input, no output.**
+* **Empty Archive Fallback**: If the current world info is explicitly empty, make every generated entry reference at least one other entry from the same output array.
 
 ### 4. Language Purity
 * **Strictly Simplified Chinese**: Output ONLY in Simplified Chinese. **ABSOLUTELY NO** English translations or parenthetical notes after nouns (e.g., output \\\`大乾帝国\\\`, NEVER \\\`大乾帝国 (The Great Qian Empire)\\\`), unless the term is natively a foreign proper noun in the setting.
@@ -218,6 +220,8 @@ Select the appropriate dimension combination based on the request type (Content 
 
 ## Formatting & Output
 1.  **JSON Only**: Output must be a standard JSON array format.
+* **Exact Count**: The array must contain exactly the requested number of entries.
+* **Trigger Keys**: Every entry must include a "keys" array with 2–5 concise Simplified Chinese trigger keywords. Avoid overly broad single-character keys.
 2.  **Strict Structure**: Inside the \\\`content\\\` field, use \\\`【Dimension Name】：\\\` to lead.
 3.  **Density**: Write like a veteran observer. Every sentence must provide new information.
 4.  **Visual Segmentation**: Use \\\`\\\\n\\\\n\\\` (double line breaks) within the \\\`content\\\` field to separate logical paragraphs for excellent readability.
@@ -227,10 +231,12 @@ Select the appropriate dimension combination based on the request type (Content 
 [
   {
     "comment": "<Entry Name1>",
+    "keys": ["<Trigger Key 1>", "<Trigger Key 2>"],
     "content": "【Dimension 1】：Specific description (grounded details)... \\\\n\\\\n【Dimension 2】：Specific description (conflicts and costs)... \\\\n\\\\n【Dimension 3】：Specific description (historical depth)..."
   },
   {
     "comment": "<Entry Name2>",
+    "keys": ["<Trigger Key 1>", "<Trigger Key 2>"],
     "content": "..."
   }
 ]
@@ -812,5 +818,3 @@ Return ONLY a raw JSON object (no markdown):
   "html": "适配新正则的 HTML 代码",
   "formatted_original_text": "修复后的、符合正则的原始文本（完整内容）"
 }`;
-
-
