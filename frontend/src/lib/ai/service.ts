@@ -2,6 +2,7 @@ import { API_BASE } from '$lib/api';
 import { PromptBuilder } from './promptBuilder';
 import { CHAR_GEN_NO_YAML, CHAR_GEN_YAML, PRESET_STUDY_PROMPT } from './templates';
 import { AiFeature, type PromptVariables } from './types';
+import { parseGeneratedWorldInfo } from './worldInfoParser';
 
 export type AiTextResult = { content: string; truncated: boolean };
 export type GeneratedWorldInfoEntry = {
@@ -50,7 +51,15 @@ export class AiService {
 
     private static choiceText(response: any): AiTextResult {
         const choice = response?.choices?.[0];
-        const content = choice?.message?.content || "";
+        const rawContent = choice?.message?.content ?? response?.response ?? response?.output_text ?? "";
+        const content = Array.isArray(rawContent)
+            ? rawContent
+                .map((part: any) => typeof part === "string" ? part : part?.text ?? part?.content ?? "")
+                .filter(Boolean)
+                .join("\n")
+            : typeof rawContent === "string"
+                ? rawContent
+                : "";
         if (!content) {
             throw new Error("AI returned empty content");
         }
@@ -288,47 +297,17 @@ export class AiService {
         try {
             const token = localStorage.getItem("auth_token");
             const result = await this.execute(feature, messages, token);
-            let content = result.choices?.[0]?.message?.content || "";
-            if (!content && result.response) content = result.response;
+            const { content, truncated } = this.choiceText(result);
+            const entries = parseGeneratedWorldInfo(content, normalizedEntryCount);
+            if (entries.length > 0) return entries;
 
-
-
-            const jsonMatch = content.match(/\[[\s\S]*\]/);
-            if (jsonMatch) {
-                content = jsonMatch[0];
-            } else {
-                content = content.replace(/^[\s\S]*?```json/i, "").replace(/^[\s\S]*?```/i, "").replace(/```[\s\S]*$/, "").trim();
-            }
-
-            try {
-                const parsed = JSON.parse(content);
-                if (!Array.isArray(parsed)) {
-                    throw new Error("生成结果不是条目数组");
-                }
-
-                return parsed
-                    .map((item: any) => {
-                        const rawKeys = item?.keys ?? item?.key ?? [];
-                        const keys = Array.isArray(rawKeys)
-                            ? rawKeys
-                            : String(rawKeys || "").split(/[,，、\n]/);
-
-                        return {
-                            comment: String(item?.comment || item?.name || "").trim(),
-                            content: String(item?.content || "").trim(),
-                            keys: keys.map((key: any) => String(key).trim()).filter(Boolean),
-                        };
-                    })
-                    .filter((item: GeneratedWorldInfoEntry) => item.comment || item.content)
-                    .slice(0, normalizedEntryCount);
-            } catch (e) {
-                if (e instanceof Error && e.message === "生成结果不是条目数组") {
-                    throw e;
-                }
-                throw new Error("生成内容无法解析为JSON");
-            }
+            throw new Error(
+                truncated
+                    ? "模型输出被截断，且没有形成完整条目；请减少生成条数后重试"
+                    : "模型没有按世界书格式返回内容；请换个模型或调整关键词后重试"
+            );
         } catch (e: any) {
-            console.error("Generate World Info Error:", e);
+            console.error("Generate World Info Error:", e instanceof Error ? e.message : e);
             throw e;
         }
     }

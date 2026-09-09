@@ -1167,8 +1167,12 @@ pub async fn execute_feature(
 
     let max_tokens = match payload.feature_id.as_str() {
         "generate_character" | "generate_opening" => 8192,
-        "optimize_description" | "optimize_first_mes" | "optimize_worldbook"
-        | "optimize_scenario" | "translate" => 8192,
+        "generate_world_info"
+        | "optimize_description"
+        | "optimize_first_mes"
+        | "optimize_worldbook"
+        | "optimize_scenario"
+        | "translate" => 8192,
         _ => 4096,
     };
 
