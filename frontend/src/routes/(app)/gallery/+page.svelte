@@ -457,17 +457,30 @@
 
     async function confirmDelete() {
         if (!imageToDelete) return;
+        const deletingId = imageToDelete;
         try {
             const token = localStorage.getItem("auth_token");
-            await fetch(`${API_BASE}/api/images/${imageToDelete}`, {
+            const res = await fetch(`${API_BASE}/api/images/${deletingId}`, {
                 method: "DELETE",
                 headers: token ? { Authorization: `Bearer ${token}` } : {},
             });
+            if (!res.ok) {
+                const result = await res.json().catch(() => ({}));
+                throw new Error(result.error || `删除失败 (${res.status})`);
+            }
+
+            if (generatedImage?.id === deletingId) generatedImage = null;
+            if (editingImage?.id === deletingId) {
+                editingImage = null;
+                editDialogOpen = false;
+            }
+
             toast.success("删除成功");
             imageCache.clear();
+            currentPage = 1;
             await fetchImages();
-        } catch (e) {
-            toast.error("删除失败");
+        } catch (e: any) {
+            toast.error("删除失败", { description: e?.message || String(e) });
         }
         deleteDialogOpen = false;
         imageToDelete = null;
@@ -1294,6 +1307,21 @@
                                         <Heart class="h-4 w-4" fill={image.is_favorite ? "currentColor" : "none"} />
                                     </button>
 
+                                    {#if !isSelectionMode}
+                                        <button
+                                            type="button"
+                                            class="absolute bottom-2 right-2 rounded-full bg-black/55 p-1.5 text-white shadow-sm transition-colors hover:bg-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+                                            aria-label={`删除图片：${image.title}`}
+                                            title="删除图片"
+                                            onclick={(e) => {
+                                                e.stopPropagation();
+                                                deleteImage(image.id);
+                                            }}
+                                        >
+                                            <Trash2 class="h-4 w-4" />
+                                        </button>
+                                    {/if}
+
                                     <!-- 标记 (AI / 已授权) -->
                                     {#if !isSelectionMode && (image.is_ai || image.is_authorized)}
                                         <div class="absolute top-2 left-2 flex gap-1">
@@ -1412,7 +1440,12 @@
                 <AlertDialog.Header>
                     <AlertDialog.Title>确定要删除吗？</AlertDialog.Title>
                     <AlertDialog.Description>
-                        此操作将永久删除 {isBatchDeleteArgs ? `选中的 ${selectedImageIds.size} 张` : "该"}图片，无法恢复。
+                        {#if isBatchDeleteArgs}
+                            此操作将永久删除选中的 {selectedImageIds.size} 张图片，无法恢复。
+                        {:else}
+                            此操作将永久删除该图片，无法恢复。
+                            只会删除图库原图，不会同时移除当前角色封面。
+                        {/if}
                     </AlertDialog.Description>
                 </AlertDialog.Header>
                 <AlertDialog.Footer>
@@ -1642,6 +1675,16 @@
                     <div class="mt-3 space-y-1">
                         <strong class="text-sm block truncate">{generatedImage.title}</strong>
                         <p class="text-xs text-muted-foreground">{generatedImage.width} × {generatedImage.height} · 已收入图库</p>
+                        <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            class="mt-3 w-full gap-2 text-destructive hover:bg-destructive/10 hover:text-destructive"
+                            onclick={() => deleteImage(generatedImage!.id)}
+                        >
+                            <Trash2 class="h-4 w-4" />
+                            不满意，删除这张
+                        </Button>
                     </div>
                 {:else}
                     <div class="aspect-[2/3] rounded-lg border border-dashed grid place-items-center text-center text-muted-foreground p-5">
@@ -1867,12 +1910,20 @@
                         导入时间: {formatDate(editingImage.created_at)}
                     </div>
 
-                    <div class="flex gap-2 pt-4">
+                    <div class="flex flex-wrap gap-2 pt-4">
                         <Button onclick={saveImageChanges}>保存</Button>
                         <Button variant="outline" onclick={() => editDialogOpen = false}>取消</Button>
                         <Button variant="outline" onclick={(e) => { e.stopPropagation(); handleExport(editingImage!.id); }}>
                             <Download class="h-4 w-4 mr-1" />
                             导出原图
+                        </Button>
+                        <Button
+                            variant="destructive"
+                            class="gap-2"
+                            onclick={() => deleteImage(editingImage!.id)}
+                        >
+                            <Trash2 class="h-4 w-4" />
+                            删除图片
                         </Button>
                     </div>
                 </div>
