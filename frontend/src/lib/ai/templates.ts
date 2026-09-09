@@ -221,7 +221,7 @@ Select the appropriate dimension combination based on the request type (Content 
 ## Formatting & Output
 1.  **JSON Only**: Output must be a standard JSON array format.
 * **Exact Count**: The array must contain exactly the requested number of entries.
-* **Trigger Keys**: Every entry must include a "keys" array with 2–5 concise Simplified Chinese trigger keywords. Avoid overly broad single-character keys.
+* **Trigger Keys**: Every entry must include a "keys" array with 8–12 useful Simplified Chinese trigger keywords. Prioritize reliable recall: cover the exact name, aliases/abbreviations, common paraphrases, related actions, objects, locations, and phrases a user may naturally type. Vary the count according to the entry instead of mechanically returning the same number for every entry. Avoid duplicates. A single-character key is allowed when it is a common, directly relevant expression (for example, "画" for an illustration entry), but do not pad the list with unrelated generic characters.
 2.  **Strict Structure**: Inside the \\\`content\\\` field, use \\\`【Dimension Name】：\\\` to lead.
 3.  **Density**: Write like a veteran observer. Every sentence must provide new information.
 4.  **Visual Segmentation**: Use \\\`\\\\n\\\\n\\\` (double line breaks) within the \\\`content\\\` field to separate logical paragraphs for excellent readability.
@@ -231,12 +231,12 @@ Select the appropriate dimension combination based on the request type (Content 
 [
   {
     "comment": "<Entry Name1>",
-    "keys": ["<Trigger Key 1>", "<Trigger Key 2>"],
+    "keys": ["<Exact Name>", "<Alias>", "<Abbreviation>", "<Common Paraphrase>", "<Related Action>", "<Related Object>", "<Related Location>", "<Natural User Phrase>"],
     "content": "【Dimension 1】：Specific description (grounded details)... \\\\n\\\\n【Dimension 2】：Specific description (conflicts and costs)... \\\\n\\\\n【Dimension 3】：Specific description (historical depth)..."
   },
   {
     "comment": "<Entry Name2>",
-    "keys": ["<Trigger Key 1>", "<Trigger Key 2>"],
+    "keys": ["<Exact Name>", "<Alias>", "<Abbreviation>", "<Common Paraphrase>", "<Related Action>", "<Related Object>", "<Related Location>", "<Natural User Phrase>"],
     "content": "..."
   }
 ]
