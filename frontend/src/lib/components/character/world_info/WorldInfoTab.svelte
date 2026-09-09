@@ -22,6 +22,16 @@
 
     import DirtyLabel from "$lib/components/common/DirtyLabel.svelte";
 
+    type CharacterGenerationContext = {
+        name?: string;
+        description?: string;
+        personality?: string;
+        scenario?: string;
+        firstMessage?: string;
+        messageExample?: string;
+        creatorNotes?: string;
+    };
+
     const FLIP_DURATION_MS = 200;
     const TOUCH_DELAY_MS = 400; // 长按 400ms 后才能拖拽
 
@@ -45,13 +55,15 @@
         mode = "character", // "character" | "global"
         name = $bindable(), // For Global Mode (DB Name)
         source = "local",
+        characterContext,
     } = $props<{
         data?: any,
         lastSaved?: number,
         onChange?: () => void,
         mode?: "character" | "global",
         name?: string,
-        source?: string
+        source?: string,
+        characterContext?: CharacterGenerationContext,
     }>();
 
     // Ensure structure exists
@@ -477,9 +489,15 @@
     let genCount = $state(3);
     let isGenerating = $state(false);
     let generatedDrafts: GeneratedDraft[] = $state([]);
+    let canGenerate = $derived(
+        genMode === "keywords"
+            ? Boolean(genKeywords.trim())
+            : Boolean(getGenerationContext()),
+    );
 
     function openGenerator() {
         generatedDrafts = [];
+        genMode = mode === "character" && getGenerationContext() ? "inspire" : "keywords";
         isGenDialogOpen = true;
     }
 
@@ -503,22 +521,69 @@
         return context.length > 16000 ? context.slice(-16000) : context;
     }
 
-    function buildGenerationRequest(count: number, hasContext: boolean) {
+    function getCharacterContext() {
+        if (mode !== "character" || !characterContext) return "";
+
+        const fields = [
+            ["角色名", characterContext.name],
+            ["角色描述", characterContext.description],
+            ["性格", characterContext.personality],
+            ["场景", characterContext.scenario],
+            ["开场白", characterContext.firstMessage],
+            ["对话示例", characterContext.messageExample],
+            ["创作者备注", characterContext.creatorNotes],
+        ]
+            .filter(([, value]) => typeof value === "string" && value.trim())
+            .map(([label, value]) => `${label}：${value!.trim()}`)
+            .join("\n\n");
+
+        return fields.length > 12000 ? fields.slice(0, 12000) : fields;
+    }
+
+    function getGenerationContext() {
+        const character = getCharacterContext();
+        const worldInfo = getCurrentWorldInfo();
+        const sections = [];
+
+        if (character) sections.push(`【角色人设表】\n${character}`);
+        if (worldInfo) sections.push(`【当前世界书（已启用条目）】\n${worldInfo}`);
+
+        return sections.join("\n\n========\n\n");
+    }
+
+    function buildGenerationRequest(count: number, hasCharacterContext: boolean, hasWorldInfo: boolean) {
         const worldName = (mode === "global" ? name : data.extensions?.world) || "未命名世界";
         if (genMode === "keywords") {
-            return `为《${worldName}》围绕以下关键词或设定锚点生成 ${count} 条彼此有关联、可直接使用的世界书条目：${genKeywords.trim()}。不要重复当前已有条目。`;
+            const characterInstruction = hasCharacterContext ? "请结合角色人设表，" : "";
+            return `为《${worldName}》围绕以下关键词或设定锚点生成 ${count} 条彼此有关联、可直接使用的世界书条目：${genKeywords.trim()}。${characterInstruction}不要重复当前已有条目。`;
         }
 
-        if (hasContext) {
-            return `为《${worldName}》一键补全 ${count} 条当前世界观中最缺失、最能产生剧情钩子的世界书条目。新条目必须与已有设定相互引用，且不要重复已有条目。`;
+        if (mode === "character" && hasCharacterContext && !hasWorldInfo) {
+            return `《${worldName}》的角色世界书目前为空。请根据角色人设表生成首批 ${count} 条最有助于稳定角色扮演的世界书条目，提炼角色相关的地点、关系、势力、规则、经历或关键物件；不要只是复述人设原文，条目之间要有关联并留下剧情钩子。`;
         }
 
-        return `为《${worldName}》原创 ${count} 条相互关联的基础世界书条目，覆盖地点、势力、人物或物件中的合适组合，并留下可继续扩展的剧情钩子。`;
+        if (mode === "character" && hasCharacterContext) {
+            return `为《${worldName}》结合角色人设表和当前世界书，补全 ${count} 条最缺失、最能稳定角色扮演并产生剧情钩子的条目。新条目应与已有设定相互引用，且不要重复人设或已有条目。`;
+        }
+
+        return `为《${worldName}》一键补全 ${count} 条当前世界观中最缺失、最能产生剧情钩子的世界书条目。新条目必须与已有设定相互引用，且不要重复已有条目。`;
     }
 
     async function handleGenerateWorldInfo() {
         if (genMode === "keywords" && !genKeywords.trim()) {
-            toast.error("先输入几个关键词或设定锚点吧");
+            toast.error("空白世界书需要先输入关键词或设定方向");
+            return;
+        }
+
+        const currentWorldInfo = getCurrentWorldInfo();
+        const currentCharacterContext = getCharacterContext();
+        const generationContext = getGenerationContext();
+        if (genMode === "inspire" && !generationContext) {
+            toast.error(
+                mode === "character"
+                    ? "角色人设表和世界书都为空，请先填写人设或改用关键词生成"
+                    : "一键补全需要至少一条已启用的世界书条目",
+            );
             return;
         }
 
@@ -527,11 +592,14 @@
         isGenerating = true;
 
         try {
-            const currentWorldInfo = getCurrentWorldInfo();
-            const request = buildGenerationRequest(count, Boolean(currentWorldInfo));
+            const request = buildGenerationRequest(
+                count,
+                Boolean(currentCharacterContext),
+                Boolean(currentWorldInfo),
+            );
             const newEntriesData = await AiService.generateWorldInfo(
                 request,
-                currentWorldInfo || "（当前世界书暂无条目）",
+                generationContext || "（当前世界书暂无条目）",
                 count,
             );
 
@@ -813,10 +881,21 @@
                     AI 世界书生成
                 </Dialog.Title>
                 <Dialog.Description>
-                    用关键词定向创作，或让 AI 基于现有设定一键补全几条。
+                    {#if mode === "character"}
+                        空白时可根据角色人设表生成；已有条目后会结合两者继续补全。
+                    {:else}
+                        用关键词定向创作，或根据当前已有条目智能补全。
+                    {/if}
                 </Dialog.Description>
-                <div class="text-xs text-orange-600 dark:text-orange-400 mt-1">
-                    生成结果会先进入预览，不会直接改动世界书。
+                <div class="text-xs text-muted-foreground mt-1">
+                    {#if mode === "character"}
+                        会读取当前人设表字段和已启用的世界书条目，不会读取聊天记录。
+                    {:else}
+                        只读取当前已启用的世界书条目，不会读取其他世界书。
+                    {/if}
+                </div>
+                <div class="text-xs text-muted-foreground mt-1">
+                    生成结果会先进入预览，确认加入后才会改动世界书。
                 </div>
             </Dialog.Header>
 
@@ -836,7 +915,8 @@
                         class="gap-2"
                         onclick={() => { genMode = "inspire"; generatedDrafts = []; }}
                     >
-                        <Lightbulb class="h-4 w-4" /> 一键补全
+                        <Lightbulb class="h-4 w-4" />
+                        {mode === "character" ? "根据人设生成" : "智能补全"}
                     </Button>
                 </div>
 
@@ -849,14 +929,29 @@
                             placeholder="例如：海上城邦、禁忌潮汐、以记忆缴税、失踪的灯塔守卫"
                             rows={3}
                         />
-                        <p class="text-xs text-muted-foreground">可以只写几个词，也可以补充时代、风格和不想出现的内容。</p>
+                        <p class="text-xs text-muted-foreground">
+                            可只写几个词，也可以补充时代、风格和不想出现的内容。
+                        </p>
                     </div>
                 {:else}
-                    <div class="rounded-lg border border-dashed bg-muted/20 p-4 text-sm text-muted-foreground">
-                        {#if getCurrentWorldInfo()}
+                    <div
+                        class={cn(
+                            "rounded-lg border border-dashed p-4 text-sm",
+                            getGenerationContext()
+                                ? "bg-muted/20 text-muted-foreground"
+                                : "border-orange-300 bg-orange-50 text-orange-700 dark:border-orange-900 dark:bg-orange-950/30 dark:text-orange-300",
+                        )}
+                    >
+                        {#if mode === "character" && getCharacterContext() && !getCurrentWorldInfo()}
+                            当前世界书为空，将根据角色名、描述、性格、场景、开场白、对话示例和创作者备注生成首批条目。
+                        {:else if mode === "character" && getCharacterContext() && getCurrentWorldInfo()}
+                            AI 会结合当前人设表和已启用的世界书条目，补充缺失设定。
+                        {:else if getCurrentWorldInfo()}
                             AI 会阅读当前已启用的条目，挑出设定缺口并补充彼此关联的新条目。
+                        {:else if mode === "character"}
+                            角色人设表和世界书都为空。请先填写人设，或切到“关键词生成”。
                         {:else}
-                            当前世界书还是空的，AI 会从世界书名称出发，先搭一组相互关联的基础设定。
+                            当前世界书为空。请先添加条目，或切到“关键词生成”。
                         {/if}
                     </div>
                 {/if}
@@ -923,13 +1018,23 @@
 
             <Dialog.Footer>
                 <Button variant="outline" onclick={() => isGenDialogOpen = false}>取消</Button>
-                <Button variant={generatedDrafts.length > 0 ? "outline" : "default"} onclick={handleGenerateWorldInfo} disabled={isGenerating}>
+                <Button
+                    variant={generatedDrafts.length > 0 ? "outline" : "default"}
+                    onclick={handleGenerateWorldInfo}
+                    disabled={isGenerating || !canGenerate}
+                >
                     {#if isGenerating}
                         <Loader2 class="mr-2 h-4 w-4 animate-spin" />
                         生成中，别关...
                     {:else}
                         <Sparkles class="mr-2 h-4 w-4" />
-                        {generatedDrafts.length > 0 ? "重新生成" : "开始生成"}
+                        {#if !canGenerate && genMode === "keywords"}
+                            先填写关键词
+                        {:else if !canGenerate}
+                            {mode === "character" ? "需要人设或条目" : "需要已有条目"}
+                        {:else}
+                            {generatedDrafts.length > 0 ? "重新生成" : "开始生成"}
+                        {/if}
                     {/if}
                 </Button>
                 {#if generatedDrafts.length > 0}

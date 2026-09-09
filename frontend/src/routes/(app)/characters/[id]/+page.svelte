@@ -1626,6 +1626,15 @@
                             bind:data={card.data.data}
                             {lastSaved}
                             source={card.source}
+                            characterContext={{
+                                name: formName,
+                                description: formDescription,
+                                personality: formPersonality,
+                                scenario: formScenario,
+                                firstMessage: formFirstMes,
+                                messageExample: formMesExample,
+                                creatorNotes: card.data.data.creator_notes || card.data.creator_notes || "",
+                            }}
                             onChange={() => (card = card)}
                         />
                     {:else}
