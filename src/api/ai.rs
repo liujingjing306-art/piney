@@ -1250,10 +1250,11 @@ use futures::stream::{self, Stream};
 use std::convert::Infallible;
 use std::time::Duration;
 
-const DOCTOR_MAX_ENTRY_ROUNDS: usize = 4;
-const DOCTOR_MAX_ENTRIES_PER_ROUND: usize = 4;
-const DOCTOR_GREETING_CHARS: usize = 2000;
-const DOCTOR_MAX_ALT_GREETINGS: usize = 12;
+const DOCTOR_MAX_ENTRY_ROUNDS: usize = 6;
+const DOCTOR_MAX_ENTRIES_PER_ROUND: usize = 6;
+const DOCTOR_GREETING_CHARS: usize = 4000;
+const DOCTOR_MAX_ALT_GREETINGS: usize = 20;
+const DOCTOR_MAX_OUTPUT_TOKENS: usize = 12_288;
 
 #[derive(Deserialize)]
 pub struct DoctorAnalyzeRequest {
@@ -1488,8 +1489,8 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
 - **权重说明：** 核心设定（Name, Description, Personality）具有最高权重。世界书内容仅作为次要权重，但两者都很重要，都需要作为诊断的依据。
 
 **请求条目格式（严格 JSON，无代码块标记）：**
-{{"action": "request_entries", "entries": ["条目名1", "条目名2", "条目名3", "条目名4"]}}
-(注意：每轮最多申请 4 个条目。你可以连续申请多轮，系统会按需提供内容。)
+{{"action": "request_entries", "entries": ["条目名1", "条目名2", "条目名3", "条目名4", "条目名5", "条目名6"]}}
+(注意：每轮最多申请 {} 个条目。你可以连续申请多轮，系统会按需提供内容。)
 (注意：请勿申请可能包含极其露骨色情(NSFW)内容的条目，以免触发系统安全拦截导致任务失败)
 
 **诊断报告格式（严格 JSON，无代码块标记）：**
@@ -1507,7 +1508,7 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
 }}}}
 
 **重要：** 所有输出必须是纯 JSON，不要包含 markdown 代码块标记。dimensions 中各字段可以使用 Markdown 格式（加粗、列表等）来增强可读性。"#,
-        global_prompt
+        global_prompt, DOCTOR_MAX_ENTRIES_PER_ROUND
     );
 
     // 构建初始 User Message
@@ -1570,7 +1571,7 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
                 "model": channel.model_id,
                 "messages": messages,
                 "temperature": 0.7,
-                "max_tokens": 8192
+                "max_tokens": DOCTOR_MAX_OUTPUT_TOKENS
             });
 
             let res = match client
@@ -1754,9 +1755,9 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
 {}
 
 **请决策：**
-- 如果需要更多信息，请返回 JSON：{{"action": "request_entries", "entries": ["新条目名1", "新条目名2", "新条目名3", "新条目名4"]}}
+- 如果需要更多信息，请返回 JSON：{{"action": "request_entries", "entries": ["新条目名1", "新条目名2", "新条目名3", "新条目名4", "新条目名5", "新条目名6"]}}（每轮最多 {} 条）
 - 如果信息已足够，请按诊断报告格式输出 JSON。"#,
-                        fetched_content
+                        fetched_content, DOCTOR_MAX_ENTRIES_PER_ROUND
                     )
                 };
 
