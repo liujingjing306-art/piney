@@ -32,6 +32,7 @@
         CheckSquare,
         Loader2,
         Settings2,
+        ImagePlus,
     } from "lucide-svelte";
     import { Label } from "$lib/components/ui/label";
     import { dndzone, TRIGGERS } from "svelte-dnd-action";
@@ -79,6 +80,7 @@
         is_authorized: boolean;
         is_favorite: boolean;
         user_notes: string | null;
+        char_cards: string[];
         created_at: string;
     }
 
@@ -176,8 +178,48 @@
     let generationQuality = $state("auto");
     let generationSetAsCover = $state(true);
     let isGeneratingImage = $state(false);
+    let isFinalizingImage = $state(false);
+    let generationStage = $state("");
+    let generationSlowTimer: ReturnType<typeof setTimeout> | null = null;
     let generatedImage = $state<ImageDetail | null>(null);
     let promptDraftSource = $state<"appearance" | "description" | "">("");
+    let coverDialogOpen = $state(false);
+    let coverCharacterId = $state("");
+    let isLoadingCoverCharacters = $state(false);
+    let isApplyingCover = $state(false);
+    let isGenerationBusy = $derived(isGeneratingImage || isFinalizingImage);
+
+    async function fetchWithTimeout(
+        input: RequestInfo | URL,
+        init: RequestInit = {},
+        timeoutMs = 60_000,
+        timeoutMessage = "请求超时，请稍后重试",
+    ) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            return await fetch(input, { ...init, signal: controller.signal });
+        } catch (error: any) {
+            if (error?.name === "AbortError") throw new Error(timeoutMessage);
+            throw error;
+        } finally {
+            clearTimeout(timer);
+        }
+    }
+
+    async function waitWithTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string) {
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        try {
+            return await Promise.race([
+                promise,
+                new Promise<never>((_, reject) => {
+                    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+                }),
+            ]);
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
+    }
 
 
     // ============ API 调用 ============
@@ -766,12 +808,30 @@
         ].filter(Boolean).join("\n\n");
     }
 
+    async function loadCharacterChoices() {
+        if (generationCharacters.length) return;
+        const choices: CharacterChoice[] = [];
+        let page = 1;
+        let totalPages = 1;
+        do {
+            const response = await fetch(
+                `${API_BASE}/api/cards/all?page=${page}&page_size=100&sort=name&order=asc`,
+                { headers: authHeaders() },
+            );
+            if (!response.ok) throw new Error("读取角色列表失败");
+            const data = await response.json();
+            choices.push(...(data.items || []));
+            totalPages = Math.max(1, Number(data.total_pages) || 1);
+            page++;
+        } while (page <= totalPages);
+        generationCharacters = choices;
+    }
+
     async function loadGenerationContext() {
         try {
-            const [channelsRes, settingsRes, cardsRes] = await Promise.all([
+            const [channelsRes, settingsRes] = await Promise.all([
                 fetch(`${API_BASE}/api/ai/channels`, { headers: authHeaders() }),
                 fetch(`${API_BASE}/api/settings`, { headers: authHeaders() }),
-                fetch(`${API_BASE}/api/cards/all?page=1&page_size=100&sort=name&order=asc`, { headers: authHeaders() }),
             ]);
             if (channelsRes.ok) {
                 generationChannels = (await channelsRes.json()).filter((channel: AiChannel) => channel.is_active);
@@ -780,9 +840,7 @@
                 const settings = await settingsRes.json();
                 generationChannelId = settings.ai_config_image || "";
             }
-            if (cardsRes.ok) {
-                generationCharacters = (await cardsRes.json()).items || [];
-            }
+            await loadCharacterChoices();
         } catch (e) {
             console.error("加载生图配置失败", e);
         }
@@ -814,63 +872,162 @@
     }
 
     async function applyGeneratedCover(image: ImageDetail, characterId: string) {
-        const source = await fetch(resolveUrl(image.file_path), { headers: authHeaders() });
+        const source = await fetchWithTimeout(
+            resolveUrl(image.file_path),
+            { headers: authHeaders() },
+            90_000,
+            "读取图库原图超时",
+        );
         if (!source.ok) throw new Error("读取图库原图失败");
         const form = new FormData();
         form.append("file", await source.blob(), "generated-cover.png");
-        const response = await fetch(`${API_BASE}/api/cards/${characterId}/cover`, {
-            method: "POST",
-            headers: authHeaders(),
-            body: form,
-        });
+        const response = await fetchWithTimeout(
+            `${API_BASE}/api/cards/${characterId}/cover`,
+            {
+                method: "POST",
+                headers: authHeaders(),
+                body: form,
+            },
+            90_000,
+            "设置角色封面超时",
+        );
         if (!response.ok) throw new Error((await response.text()) || "设置角色封面失败");
         listNeedsRefresh.set(true);
     }
 
-    async function generateGalleryImage() {
-        if (!generationChannelId || !generationPrompt.trim() || isGeneratingImage) return;
-        isGeneratingImage = true;
-        generatedImage = null;
+    async function openSetCoverDialog() {
+        if (!editingImage) return;
+        coverCharacterId = editingImage.char_cards?.[0] || "";
+        coverDialogOpen = true;
+        if (generationCharacters.length) return;
+        isLoadingCoverCharacters = true;
         try {
-            const response = await fetch(`${API_BASE}/api/ai/images/generate`, {
-                method: "POST",
-                headers: authHeaders({ "Content-Type": "application/json" }),
-                body: JSON.stringify({
-                    channel_id: generationChannelId,
-                    prompt: generationPrompt.trim(),
-                    negative_prompt: generationNegativePrompt.trim() || null,
-                    size: generationSize,
-                    quality: generationQuality,
-                    character_id: generationCharacterId || null,
-                }),
-            });
-            const result = await response.json().catch(() => ({}));
+            await loadCharacterChoices();
+        } catch (error: any) {
+            toast.error("读取角色列表失败", { description: error?.message || String(error) });
+        } finally {
+            isLoadingCoverCharacters = false;
+        }
+    }
+
+    async function setEditingImageAsCover() {
+        if (!editingImage || !coverCharacterId || isApplyingCover) return;
+        const image = editingImage;
+        isApplyingCover = true;
+        try {
+            await applyGeneratedCover(image, coverCharacterId);
+            const relatedCards = Array.from(new Set([...(image.char_cards || []), coverCharacterId]));
+            try {
+                const relationResponse = await fetchWithTimeout(
+                    `${API_BASE}/api/images/${image.id}`,
+                    {
+                        method: "PATCH",
+                        headers: authHeaders({ "Content-Type": "application/json" }),
+                        body: JSON.stringify({ char_cards: relatedCards }),
+                    },
+                    30_000,
+                    "保存图片与角色的关联超时",
+                );
+                if (!relationResponse.ok) {
+                    throw new Error(await relationResponse.text());
+                }
+                image.char_cards = relatedCards;
+            } catch (relationError) {
+                console.warn("封面已更新，但保存图库角色关联失败", relationError);
+                toast.warning("封面已经更新，但图库没有记住角色关联");
+            }
+            coverDialogOpen = false;
+            const character = generationCharacters.find((item) => item.id === coverCharacterId);
+            toast.success(`已设为${character?.name ? `「${character.name}」的` : "角色"}封面`);
+        } catch (error: any) {
+            toast.error("设置封面失败", { description: error?.message || String(error) });
+        } finally {
+            isApplyingCover = false;
+        }
+    }
+
+    async function generateGalleryImage() {
+        if (!generationChannelId || !generationPrompt.trim() || isGenerationBusy) return;
+        isGeneratingImage = true;
+        generationStage = "正在等待模型生成…";
+        generatedImage = null;
+        generationSlowTimer = setTimeout(() => {
+            if (isGeneratingImage) generationStage = "模型可能已经画完，正在等待中转回传图片…";
+        }, 90_000);
+        let result: any = null;
+        try {
+            const response = await fetchWithTimeout(
+                `${API_BASE}/api/ai/images/generate`,
+                {
+                    method: "POST",
+                    headers: authHeaders({ "Content-Type": "application/json" }),
+                    body: JSON.stringify({
+                        channel_id: generationChannelId,
+                        prompt: generationPrompt.trim(),
+                        negative_prompt: generationNegativePrompt.trim() || null,
+                        size: generationSize,
+                        quality: generationQuality,
+                        character_id: generationCharacterId || null,
+                    }),
+                },
+                13 * 60_000,
+                "等待生图结果超时；如果中转已经显示成功，请稍后刷新图库确认图片是否入库",
+            );
+            result = await response.json().catch(() => ({}));
             if (!response.ok) throw new Error(result.error || `生图失败 (${response.status})`);
             generatedImage = result.image;
+        } catch (e: any) {
+            toast.error("生图失败", { description: e?.message || String(e) });
+            return;
+        } finally {
+            if (generationSlowTimer) clearTimeout(generationSlowTimer);
+            generationSlowTimer = null;
+            isGeneratingImage = false;
+        }
 
-            await fetch(`${API_BASE}/api/settings`, {
-                method: "PATCH",
-                headers: authHeaders({ "Content-Type": "application/json" }),
-                body: JSON.stringify({ ai_config_image: generationChannelId }),
-            });
+        isFinalizingImage = true;
+        let coverApplied = false;
+        try {
+            generationStage = "图片已收入图库，正在保存模型选择…";
+            try {
+                await fetchWithTimeout(
+                    `${API_BASE}/api/settings`,
+                    {
+                        method: "PATCH",
+                        headers: authHeaders({ "Content-Type": "application/json" }),
+                        body: JSON.stringify({ ai_config_image: generationChannelId }),
+                    },
+                    30_000,
+                    "保存模型选择超时",
+                );
+            } catch (settingsError) {
+                console.warn("图片已入库，但保存生图模型选择失败", settingsError);
+            }
 
-            let coverApplied = false;
             if (generationCharacterId && generationSetAsCover) {
+                generationStage = "图片已收入图库，正在设置角色封面…";
                 try {
                     await applyGeneratedCover(result.image, generationCharacterId);
                     coverApplied = true;
-                } catch (coverError) {
-                    toast.warning("图片已收入图库，但角色封面没有更新", { description: String(coverError) });
+                } catch (coverError: any) {
+                    toast.warning("图片已收入图库，但角色封面没有更新", {
+                        description: coverError?.message || String(coverError),
+                    });
                 }
             }
+
+            generationStage = "图片已收入图库，正在刷新图库…";
             imageCache.clear();
             currentPage = 1;
-            await fetchImages();
+            try {
+                await waitWithTimeout(fetchImages(), 30_000, "刷新图库超时");
+            } catch (refreshError) {
+                console.warn("图片已入库，但刷新图库超时", refreshError);
+            }
             toast.success(coverApplied ? "图片已生成并设为角色封面" : "图片已生成并收入图库");
-        } catch (e: any) {
-            toast.error("生图失败", { description: e?.message || String(e) });
         } finally {
-            isGeneratingImage = false;
+            isFinalizingImage = false;
+            generationStage = "";
         }
     }
 
@@ -1689,8 +1846,13 @@
                 {:else}
                     <div class="aspect-[2/3] rounded-lg border border-dashed grid place-items-center text-center text-muted-foreground p-5">
                         <div class="space-y-2">
-                            <Sparkles class="h-8 w-8 mx-auto opacity-50" />
-                            <p class="text-sm">成图会在这里预览</p>
+                            {#if isGenerationBusy}
+                                <Loader2 class="h-8 w-8 mx-auto animate-spin text-primary" />
+                                <p class="text-sm leading-relaxed">{generationStage}</p>
+                            {:else}
+                                <Sparkles class="h-8 w-8 mx-auto opacity-50" />
+                                <p class="text-sm">成图会在这里预览</p>
+                            {/if}
                         </div>
                     </div>
                 {/if}
@@ -1701,13 +1863,61 @@
             <Button variant="outline" onclick={() => (generationDialogOpen = false)}>完成</Button>
             <Button
                 class="gap-2"
-                disabled={!generationChannelId || !generationPrompt.trim() || isGeneratingImage}
+                disabled={!generationChannelId || !generationPrompt.trim() || isGenerationBusy}
                 onclick={generateGalleryImage}
             >
-                {#if isGeneratingImage}
-                    <Loader2 class="h-4 w-4 animate-spin" /> 正在生成……
+                {#if isGenerationBusy}
+                    <Loader2 class="h-4 w-4 animate-spin" /> {generationStage || "正在处理…"}
                 {:else}
                     <Sparkles class="h-4 w-4" /> {generatedImage ? "按当前提示词再生成" : "生成图片"}
+                {/if}
+            </Button>
+        </Dialog.Footer>
+    </Dialog.Content>
+</Dialog.Root>
+
+<!-- 从图库图片直接设置角色封面 -->
+<Dialog.Root bind:open={coverDialogOpen}>
+    <Dialog.Content class="!w-[92%] sm:!max-w-md">
+        <Dialog.Header>
+            <Dialog.Title class="flex items-center gap-2">
+                <ImagePlus class="h-5 w-5 text-primary" />
+                设为角色封面
+            </Dialog.Title>
+            <Dialog.Description>
+                直接使用这张图库原图，不需要先保存图片信息；封面会按现有规则裁成 512 × 768。
+            </Dialog.Description>
+        </Dialog.Header>
+
+        <div class="space-y-2 py-3">
+            <Label for="cover-character">选择角色卡</Label>
+            <select
+                id="cover-character"
+                class="w-full h-10 px-3 rounded-md border bg-background text-sm"
+                bind:value={coverCharacterId}
+                disabled={isLoadingCoverCharacters || isApplyingCover}
+            >
+                <option value="">
+                    {isLoadingCoverCharacters ? "正在读取角色列表…" : "请选择要更换封面的角色"}
+                </option>
+                {#each generationCharacters as character}
+                    <option value={character.id}>{character.name}</option>
+                {/each}
+            </select>
+            {#if !isLoadingCoverCharacters && !generationCharacters.length}
+                <p class="text-sm text-muted-foreground">当前还没有可用的角色卡。</p>
+            {/if}
+        </div>
+
+        <Dialog.Footer class="gap-2 sm:gap-0">
+            <Button variant="outline" disabled={isApplyingCover} onclick={() => (coverDialogOpen = false)}>
+                取消
+            </Button>
+            <Button class="gap-2" disabled={!coverCharacterId || isLoadingCoverCharacters || isApplyingCover} onclick={setEditingImageAsCover}>
+                {#if isApplyingCover}
+                    <Loader2 class="h-4 w-4 animate-spin" /> 正在设置…
+                {:else}
+                    <ImagePlus class="h-4 w-4" /> 设为封面
                 {/if}
             </Button>
         </Dialog.Footer>
@@ -1913,6 +2123,10 @@
                     <div class="flex flex-wrap gap-2 pt-4">
                         <Button onclick={saveImageChanges}>保存</Button>
                         <Button variant="outline" onclick={() => editDialogOpen = false}>取消</Button>
+                        <Button variant="outline" class="gap-2" onclick={openSetCoverDialog}>
+                            <ImagePlus class="h-4 w-4" />
+                            设为封面
+                        </Button>
                         <Button variant="outline" onclick={(e) => { e.stopPropagation(); handleExport(editingImage!.id); }}>
                             <Download class="h-4 w-4 mr-1" />
                             导出原图

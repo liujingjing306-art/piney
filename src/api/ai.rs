@@ -1,17 +1,21 @@
 use crate::entities::{ai_channel, character_card, setting};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use axum::{
-    Json,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
+    Json,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::time::Duration;
 use uuid::Uuid;
+
+const IMAGE_PROVIDER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const IMAGE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
 #[derive(Deserialize)]
 pub struct CreateChannelRequest {
@@ -45,9 +49,15 @@ fn image_endpoint_candidates(base_url: &str) -> Vec<String> {
     // dedicated image API uses /images. Prefer the provider's native route and
     // retain the other OpenAI-compatible shape as a safe 404/405 fallback.
     if base.contains("openrouter.ai") {
-        vec![format!("{}/images", base), format!("{}/images/generations", base)]
+        vec![
+            format!("{}/images", base),
+            format!("{}/images/generations", base),
+        ]
     } else {
-        vec![format!("{}/images/generations", base), format!("{}/images", base)]
+        vec![
+            format!("{}/images/generations", base),
+            format!("{}/images", base),
+        ]
     }
 }
 
@@ -159,7 +169,11 @@ pub async fn generate_image(
         None => prompt.to_string(),
     };
     let size = payload.size.as_deref().unwrap_or("1024x1536").trim();
-    if size.len() > 32 || !size.chars().all(|char| char.is_ascii_alphanumeric() || char == 'x' || char == '-') {
+    if size.len() > 32
+        || !size
+            .chars()
+            .all(|char| char.is_ascii_alphanumeric() || char == 'x' || char == '-')
+    {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "图片尺寸格式不正确"})),
@@ -173,7 +187,12 @@ pub async fn generate_image(
         "size": size,
         "response_format": "b64_json"
     });
-    if let Some(quality) = payload.quality.as_deref().map(str::trim).filter(|value| !value.is_empty() && *value != "auto") {
+    if let Some(quality) = payload
+        .quality
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "auto")
+    {
         body["quality"] = Value::String(quality.to_string());
     }
 
@@ -184,6 +203,7 @@ pub async fn generate_image(
             .header("Authorization", format!("Bearer {}", channel.api_key))
             .header("Content-Type", "application/json")
             .json(request_body)
+            .timeout(IMAGE_PROVIDER_TIMEOUT)
             .send()
     };
 
@@ -191,9 +211,14 @@ pub async fn generate_image(
     let mut response_and_url = None;
     for (index, url) in endpoints.iter().enumerate() {
         let current = send(url, &body).await.map_err(|e| {
+            let detail = if e.is_timeout() {
+                "等待生图渠道返回结果超时（10 分钟）；中转若已显示成功，请稍后检查图库".to_string()
+            } else {
+                format!("生图渠道连接失败: {}", e)
+            };
             (
                 StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({"error": format!("生图渠道连接失败: {}", e)})),
+                Json(serde_json::json!({"error": detail})),
             )
         })?;
         if matches!(current.status().as_u16(), 404 | 405) && index + 1 < endpoints.len() {
@@ -209,9 +234,14 @@ pub async fn generate_image(
         body.as_object_mut()
             .map(|object| object.remove("response_format"));
         response = send(used_url, &body).await.map_err(|e| {
+            let detail = if e.is_timeout() {
+                "等待生图渠道返回结果超时（10 分钟）；中转若已显示成功，请稍后检查图库".to_string()
+            } else {
+                format!("生图渠道连接失败: {}", e)
+            };
             (
                 StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({"error": format!("生图渠道连接失败: {}", e)})),
+                Json(serde_json::json!({"error": detail})),
             )
         })?;
     }
@@ -225,9 +255,14 @@ pub async fn generate_image(
     }
 
     let response_json: Value = response.json().await.map_err(|e| {
+        let detail = if e.is_timeout() {
+            "生图已经开始返回，但图片数据接收超时；中转若已显示成功，请稍后检查图库".to_string()
+        } else {
+            format!("生图渠道没有返回有效 JSON: {}", e)
+        };
         (
             StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": format!("生图渠道没有返回有效 JSON: {}", e)})),
+            Json(serde_json::json!({"error": detail})),
         )
     })?;
     let item = response_json
@@ -242,7 +277,10 @@ pub async fn generate_image(
         })?;
 
     let image_bytes = if let Some(encoded) = item.get("b64_json").and_then(Value::as_str) {
-        let clean = encoded.rsplit_once(',').map(|(_, value)| value).unwrap_or(encoded);
+        let clean = encoded
+            .rsplit_once(',')
+            .map(|(_, value)| value)
+            .unwrap_or(encoded);
         BASE64_STANDARD.decode(clean).map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
@@ -262,24 +300,45 @@ pub async fn generate_image(
                 Json(serde_json::json!({"error": "生图渠道返回的图片地址不是 HTTP(S)"})),
             ));
         }
-        let download = client.get(parsed).send().await.map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({"error": format!("下载生成图片失败: {}", e)})),
-            )
-        })?;
+        let download = client
+            .get(parsed)
+            .timeout(IMAGE_DOWNLOAD_TIMEOUT)
+            .send()
+            .await
+            .map_err(|e| {
+                let detail = if e.is_timeout() {
+                    "中转已经返回图片地址，但下载原图超时（2 分钟）".to_string()
+                } else {
+                    format!("下载生成图片失败: {}", e)
+                };
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": detail})),
+                )
+            })?;
         if !download.status().is_success() {
             return Err((
                 StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({"error": format!("下载生成图片失败 ({})", download.status())})),
+                Json(
+                    serde_json::json!({"error": format!("下载生成图片失败 ({})", download.status())}),
+                ),
             ));
         }
-        download.bytes().await.map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({"error": format!("读取生成图片失败: {}", e)})),
-            )
-        })?.to_vec()
+        download
+            .bytes()
+            .await
+            .map_err(|e| {
+                let detail = if e.is_timeout() {
+                    "中转已经返回图片地址，但读取原图超时（2 分钟）".to_string()
+                } else {
+                    format!("读取生成图片失败: {}", e)
+                };
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": detail})),
+                )
+            })?
+            .to_vec()
     } else {
         return Err((
             StatusCode::BAD_GATEWAY,
@@ -1248,7 +1307,6 @@ use crate::entities::doctor_task;
 use axum::response::sse::{Event, Sse};
 use futures::stream::{self, Stream};
 use std::convert::Infallible;
-use std::time::Duration;
 
 const DOCTOR_MAX_ENTRY_ROUNDS: usize = 6;
 const DOCTOR_MAX_ENTRIES_PER_ROUND: usize = 6;

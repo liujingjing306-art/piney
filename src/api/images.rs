@@ -47,6 +47,7 @@ pub struct UpdateImageRequest {
     pub is_authorized: Option<bool>,
     pub is_favorite: Option<bool>,
     pub user_notes: Option<String>,
+    pub char_cards: Option<Vec<Uuid>>,
 }
 
 #[derive(Deserialize)]
@@ -818,6 +819,10 @@ pub async fn update(
     }
     if let Some(notes) = payload.user_notes {
         active.user_notes = Set(Some(notes));
+    }
+    if let Some(char_cards) = payload.char_cards {
+        active.char_cards =
+            Set(serde_json::to_string(&char_cards).unwrap_or_else(|_| "[]".to_string()));
     }
 
     let result = active.update(&db).await.map_err(|e| {
