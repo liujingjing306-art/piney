@@ -4,6 +4,38 @@ export type ParsedWorldInfoEntry = {
     keys: string[];
 };
 
+/**
+ * Count characters that cannot be safely saved as readable Unicode text.
+ * U+FFFD means decoding has already lost the original character. Unpaired
+ * UTF-16 surrogates can also render as U+FFFD even when the code unit itself
+ * is still present in the parsed JSON string.
+ */
+export function countBrokenUnicode(value: string): number {
+    let brokenCount = 0;
+
+    for (let index = 0; index < value.length; index += 1) {
+        const codeUnit = value.charCodeAt(index);
+        if (codeUnit === 0xfffd) {
+            brokenCount += 1;
+            continue;
+        }
+
+        if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+            const nextCodeUnit = value.charCodeAt(index + 1);
+            if (nextCodeUnit >= 0xdc00 && nextCodeUnit <= 0xdfff) {
+                index += 1;
+            } else {
+                brokenCount += 1;
+            }
+            continue;
+        }
+
+        if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) brokenCount += 1;
+    }
+
+    return brokenCount;
+}
+
 const ARRAY_WRAPPER_KEYS = [
     "entries",
     "worldInfo",

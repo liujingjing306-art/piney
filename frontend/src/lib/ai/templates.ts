@@ -188,6 +188,7 @@ You are an objective recorder across dimensions. Your duty is to construct archi
 
 ### 4. Language Purity
 * **Strictly Simplified Chinese**: Output ONLY in Simplified Chinese. **ABSOLUTELY NO** English translations or parenthetical notes after nouns (e.g., output \\\`大乾帝国\\\`, NEVER \\\`大乾帝国 (The Great Qian Empire)\\\`), unless the term is natively a foreign proper noun in the setting.
+* **Valid Unicode Only**: Every character must be complete, valid Unicode. Never output the replacement character �, a lone surrogate, mojibake, or an unreadable placeholder. Prefer common Simplified Chinese characters. If the source itself contains a damaged character, rewrite or omit the affected proper noun instead of copying or guessing the broken glyph.
 * **No Meta-Jargon**: Do not use vocabulary that sounds like a game design document or sociology paper. Write as if describing a real, living world.
 
 ## Dynamic Dimension Framework

@@ -1204,9 +1204,23 @@ pub async fn execute_feature(
             )
         })?;
 
-    // 获取响应状态和原始文本
+    // Strictly decode provider responses so malformed UTF-8 is reported instead
+    // of being silently replaced with U+FFFD and stored in generated content.
     let status = res.status();
-    let raw_text = res.text().await.unwrap_or_default();
+    let raw_bytes = res.bytes().await.map_err(|e| {
+        tracing::error!("Failed to read AI provider response: {}", e);
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "读取 AI 服务商响应失败，请重试"})),
+        )
+    })?;
+    let raw_text = String::from_utf8(raw_bytes.to_vec()).map_err(|e| {
+        tracing::error!("AI provider returned invalid UTF-8: {}", e);
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "AI 服务商返回了损坏的文字编码，请重新生成"})),
+        )
+    })?;
 
     // 调试日志：打印响应内容
 

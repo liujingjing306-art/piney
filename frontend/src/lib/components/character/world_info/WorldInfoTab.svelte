@@ -6,6 +6,7 @@
     import { Plus, Search, Download, FileDown, FileUp, MoreHorizontal, Bot, Sparkles, Loader2, Lightbulb, WandSparkles, X } from "lucide-svelte";
     import { toast } from "svelte-sonner";
     import { AiService } from "$lib/ai/service";
+    import { countBrokenUnicode } from "$lib/ai/worldInfoParser";
     import * as Dialog from "$lib/components/ui/dialog";
     import { Textarea } from "$lib/components/ui/textarea";
     import { Checkbox } from "$lib/components/ui/checkbox";
@@ -489,6 +490,14 @@
     let genCount = $state(3);
     let isGenerating = $state(false);
     let generatedDrafts: GeneratedDraft[] = $state([]);
+    let generatedBrokenUnicodeCount = $derived(
+        generatedDrafts.reduce((total, draft) => total + getDraftBrokenUnicodeCount(draft), 0),
+    );
+    let selectedBrokenUnicodeCount = $derived(
+        generatedDrafts
+            .filter((draft) => draft.selected)
+            .reduce((total, draft) => total + getDraftBrokenUnicodeCount(draft), 0),
+    );
     let canGenerate = $derived(
         genMode === "keywords"
             ? Boolean(genKeywords.trim())
@@ -499,6 +508,12 @@
         generatedDrafts = [];
         genMode = mode === "character" && getGenerationContext() ? "inspire" : "keywords";
         isGenDialogOpen = true;
+    }
+
+    function getDraftBrokenUnicodeCount(draft: GeneratedDraft) {
+        return countBrokenUnicode(draft.comment)
+            + countBrokenUnicode(draft.keysText)
+            + countBrokenUnicode(draft.content);
     }
 
     function getCurrentWorldInfo() {
@@ -610,7 +625,13 @@
                     keysText: item.keys.join("、"),
                     selected: true,
                 }));
-                toast.success(`生成了 ${generatedDrafts.length} 条，确认后再加入世界书`);
+                if (generatedBrokenUnicodeCount > 0) {
+                    toast.warning(
+                        `生成内容有 ${generatedBrokenUnicodeCount} 处损坏字符，已标出；请修改或重新生成`,
+                    );
+                } else {
+                    toast.success(`生成了 ${generatedDrafts.length} 条，确认后再加入世界书`);
+                }
             } else {
                 toast.error("AI 没有返回可用条目，请换个关键词重试");
             }
@@ -625,6 +646,12 @@
         const selected = generatedDrafts.filter((draft) => draft.selected);
         if (selected.length === 0) {
             toast.error("至少选择一条再加入世界书");
+            return;
+        }
+        if (selectedBrokenUnicodeCount > 0) {
+            toast.error(
+                `选中的条目还有 ${selectedBrokenUnicodeCount} 处损坏字符，请修改或取消勾选后再加入`,
+            );
             return;
         }
 
@@ -978,8 +1005,21 @@
                             <Label>生成预览</Label>
                             <span class="text-xs text-muted-foreground">可编辑、可取消勾选</span>
                         </div>
+                        {#if generatedBrokenUnicodeCount > 0}
+                            <div
+                                role="alert"
+                                class="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+                            >
+                                检测到 {generatedBrokenUnicodeCount} 处损坏字符（�）。原字已经无法恢复；红框中的内容需要手动修改、取消勾选，或重新生成后才能加入世界书。
+                            </div>
+                        {/if}
                         {#each generatedDrafts as draft, index}
-                            <div class="rounded-xl border bg-card p-4 space-y-3">
+                            <div
+                                class={cn(
+                                    "rounded-xl border bg-card p-4 space-y-3",
+                                    getDraftBrokenUnicodeCount(draft) > 0 && "border-destructive/60",
+                                )}
+                            >
                                 <div class="flex items-start gap-3">
                                     <Checkbox
                                         aria-label={`选择第 ${index + 1} 条`}
@@ -989,11 +1029,20 @@
                                     <div class="grid flex-1 gap-3 sm:grid-cols-2">
                                         <div class="space-y-1.5">
                                             <Label for={`generated-entry-name-${index}`}>条目名称</Label>
-                                            <Input id={`generated-entry-name-${index}`} bind:value={draft.comment} />
+                                            <Input
+                                                id={`generated-entry-name-${index}`}
+                                                bind:value={draft.comment}
+                                                aria-invalid={countBrokenUnicode(draft.comment) > 0}
+                                            />
                                         </div>
                                         <div class="space-y-1.5">
                                             <Label for={`generated-entry-keys-${index}`}>触发关键词</Label>
-                                            <Input id={`generated-entry-keys-${index}`} bind:value={draft.keysText} placeholder="用逗号或顿号分隔" />
+                                            <Input
+                                                id={`generated-entry-keys-${index}`}
+                                                bind:value={draft.keysText}
+                                                placeholder="用逗号或顿号分隔"
+                                                aria-invalid={countBrokenUnicode(draft.keysText) > 0}
+                                            />
                                         </div>
                                     </div>
                                     <Button
@@ -1008,7 +1057,17 @@
                                 </div>
                                 <div class="space-y-1.5 pl-8">
                                     <Label for={`generated-entry-content-${index}`}>条目内容</Label>
-                                    <Textarea id={`generated-entry-content-${index}`} bind:value={draft.content} rows={5} />
+                                    <Textarea
+                                        id={`generated-entry-content-${index}`}
+                                        bind:value={draft.content}
+                                        rows={5}
+                                        aria-invalid={countBrokenUnicode(draft.content) > 0}
+                                    />
+                                    {#if getDraftBrokenUnicodeCount(draft) > 0}
+                                        <p class="text-xs text-destructive">
+                                            本条有 {getDraftBrokenUnicodeCount(draft)} 处损坏字符；删除或改写所有 � 后可正常加入。
+                                        </p>
+                                    {/if}
                                 </div>
                             </div>
                         {/each}
@@ -1038,7 +1097,10 @@
                     {/if}
                 </Button>
                 {#if generatedDrafts.length > 0}
-                    <Button onclick={addGeneratedEntries} disabled={!generatedDrafts.some((draft) => draft.selected)}>
+                    <Button
+                        onclick={addGeneratedEntries}
+                        disabled={!generatedDrafts.some((draft) => draft.selected) || selectedBrokenUnicodeCount > 0}
+                    >
                         <Plus class="mr-2 h-4 w-4" />
                         加入世界书（{generatedDrafts.filter((draft) => draft.selected).length}）
                     </Button>
