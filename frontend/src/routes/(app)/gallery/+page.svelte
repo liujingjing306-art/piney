@@ -1,5 +1,5 @@
 <script lang="ts">
-    import { onMount } from "svelte";
+    import { onMount, tick } from "svelte";
     import { goto } from "$app/navigation";
     import { toast } from "svelte-sonner";
     import { cn } from "$lib/utils";
@@ -898,6 +898,8 @@
     async function openSetCoverDialog() {
         if (!editingImage) return;
         coverCharacterId = editingImage.char_cards?.[0] || "";
+        editDialogOpen = false;
+        await tick();
         coverDialogOpen = true;
         if (generationCharacters.length) return;
         isLoadingCoverCharacters = true;
@@ -908,6 +910,17 @@
         } finally {
             isLoadingCoverCharacters = false;
         }
+    }
+
+    async function returnToImageEditor() {
+        coverDialogOpen = false;
+        await tick();
+        if (editingImage) editDialogOpen = true;
+    }
+
+    function handleCoverDialogChange(open: boolean) {
+        coverDialogOpen = open;
+        if (!open && !isApplyingCover) void returnToImageEditor();
     }
 
     async function setEditingImageAsCover() {
@@ -936,7 +949,7 @@
                 console.warn("封面已更新，但保存图库角色关联失败", relationError);
                 toast.warning("封面已经更新，但图库没有记住角色关联");
             }
-            coverDialogOpen = false;
+            await returnToImageEditor();
             const character = generationCharacters.find((item) => item.id === coverCharacterId);
             toast.success(`已设为${character?.name ? `「${character.name}」的` : "角色"}封面`);
         } catch (error: any) {
@@ -1877,7 +1890,7 @@
 </Dialog.Root>
 
 <!-- 从图库图片直接设置角色封面 -->
-<Dialog.Root bind:open={coverDialogOpen}>
+<Dialog.Root open={coverDialogOpen} onOpenChange={handleCoverDialogChange}>
     <Dialog.Content class="!w-[92%] sm:!max-w-md">
         <Dialog.Header>
             <Dialog.Title class="flex items-center gap-2">
@@ -1910,7 +1923,7 @@
         </div>
 
         <Dialog.Footer class="gap-2 sm:gap-0">
-            <Button variant="outline" disabled={isApplyingCover} onclick={() => (coverDialogOpen = false)}>
+            <Button variant="outline" disabled={isApplyingCover} onclick={returnToImageEditor}>
                 取消
             </Button>
             <Button class="gap-2" disabled={!coverCharacterId || isLoadingCoverCharacters || isApplyingCover} onclick={setEditingImageAsCover}>
