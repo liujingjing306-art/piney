@@ -33,6 +33,8 @@ pub struct Settings {
     pub ai_config_global: Option<String>,
     /// 图库生图默认渠道 ID
     pub ai_config_image: Option<String>,
+    /// 图库生图提示词预设（JSON 字符串）
+    pub image_prompt_presets: Option<String>,
     /// 全局提示词
     pub global_prompt: Option<String>,
 }
@@ -56,6 +58,7 @@ pub async fn get(State(db): State<DatabaseConnection>) -> Json<Settings> {
         avatar: None,
         ai_config_global: None,
         ai_config_image: None,
+        image_prompt_presets: None,
         global_prompt: None,
     };
 
@@ -73,6 +76,7 @@ pub async fn get(State(db): State<DatabaseConnection>) -> Json<Settings> {
             "user_avatar" => s.avatar = Some(setting.value),
             "ai_config_global" => s.ai_config_global = Some(setting.value),
             "ai_config_image" => s.ai_config_image = Some(setting.value),
+            "image_prompt_presets" => s.image_prompt_presets = Some(setting.value),
             "global_prompt" => s.global_prompt = Some(setting.value),
             _ => {}
         }
@@ -107,6 +111,7 @@ pub async fn update(
                 "avatar" => "user_avatar", // Map 'avatar' to 'user_avatar'
                 "ai_config_global" => "ai_config_global",
                 "ai_config_image" => "ai_config_image",
+                "image_prompt_presets" => "image_prompt_presets",
                 "global_prompt" => "global_prompt",
                 _ => continue,
             };

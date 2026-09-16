@@ -97,6 +97,13 @@
         avatar: string | null;
     }
 
+    interface ImagePromptPreset {
+        id: string;
+        name: string;
+        prompt: string;
+        negativePrompt: string;
+    }
+
     // ============ 颜色常量 ============
     const COLOR_OPTIONS = [
         { value: "red", label: "红色", color: "#FF0000" },
@@ -174,6 +181,10 @@
     let generationCharacterId = $state("");
     let generationPrompt = $state("");
     let generationNegativePrompt = $state("low quality, blurry, watermark, text, logo, malformed hands, distorted face");
+    let generationPromptPresets = $state<ImagePromptPreset[]>([]);
+    let selectedPromptPresetId = $state("");
+    let promptPresetName = $state("");
+    let isSavingPromptPreset = $state(false);
     let generationSize = $state("1024x1536");
     let generationQuality = $state("auto");
     let generationSetAsCover = $state(true);
@@ -808,6 +819,118 @@
         ].filter(Boolean).join("\n\n");
     }
 
+    function parseImagePromptPresets(value: unknown): ImagePromptPreset[] {
+        if (typeof value !== "string" || !value.trim()) return [];
+        try {
+            const parsed = JSON.parse(value);
+            if (!Array.isArray(parsed)) return [];
+            return parsed
+                .filter((item) => item && typeof item === "object")
+                .map((item): ImagePromptPreset | null => {
+                    const id = typeof item.id === "string" ? item.id.trim() : "";
+                    const name = typeof item.name === "string" ? item.name.trim() : "";
+                    const prompt = typeof item.prompt === "string" ? item.prompt.trim() : "";
+                    const negativePrompt = typeof item.negativePrompt === "string" ? item.negativePrompt.trim() : "";
+                    if (!id || !name || (!prompt && !negativePrompt)) return null;
+                    return { id, name, prompt, negativePrompt };
+                })
+                .filter((item): item is ImagePromptPreset => Boolean(item))
+                .slice(0, 50);
+        } catch {
+            return [];
+        }
+    }
+
+    async function persistImagePromptPresets(presets: ImagePromptPreset[]) {
+        const response = await fetchWithTimeout(
+            `${API_BASE}/api/settings`,
+            {
+                method: "PATCH",
+                headers: authHeaders({ "Content-Type": "application/json" }),
+                body: JSON.stringify({ image_prompt_presets: JSON.stringify(presets) }),
+            },
+            30_000,
+            "保存提示词预设超时",
+        );
+        if (!response.ok) throw new Error("服务器没有保存提示词预设");
+        generationPromptPresets = presets;
+    }
+
+    async function saveCurrentPromptPreset() {
+        const prompt = generationPrompt.trim();
+        const negativePrompt = generationNegativePrompt.trim();
+        if (!prompt && !negativePrompt) {
+            toast.error("请先填写正向或负向提示词");
+            return;
+        }
+
+        const fallbackName = (prompt || negativePrompt)
+            .split(/\r?\n/)[0]
+            .replace(/[，。,.!?！？]+$/g, "")
+            .slice(0, 24) || `提示词预设 ${generationPromptPresets.length + 1}`;
+        const name = promptPresetName.trim().slice(0, 60) || fallbackName;
+        const existing = generationPromptPresets.find((preset) => preset.name === name);
+        if (!existing && generationPromptPresets.length >= 50) {
+            toast.error("提示词预设最多保存 50 个");
+            return;
+        }
+        const id = existing?.id || crypto.randomUUID();
+        const nextPreset = { id, name, prompt, negativePrompt };
+        const nextPresets = existing
+            ? generationPromptPresets.map((preset) => preset.id === existing.id ? nextPreset : preset)
+            : [...generationPromptPresets, nextPreset];
+
+        isSavingPromptPreset = true;
+        try {
+            await persistImagePromptPresets(nextPresets);
+            selectedPromptPresetId = id;
+            promptPresetName = "";
+            toast.success(existing ? `已更新预设「${name}」` : `已保存预设「${name}」`);
+        } catch (e: any) {
+            toast.error("保存预设失败", { description: e?.message || String(e) });
+        } finally {
+            isSavingPromptPreset = false;
+        }
+    }
+
+    function applyPromptPreset(mode: "append" | "replace") {
+        const preset = generationPromptPresets.find((item) => item.id === selectedPromptPresetId);
+        if (!preset) {
+            toast.error("请先选择一个提示词预设");
+            return;
+        }
+
+        if (mode === "replace") {
+            generationPrompt = preset.prompt;
+            generationNegativePrompt = preset.negativePrompt;
+        } else {
+            if (preset.prompt && !generationPrompt.includes(preset.prompt)) {
+                generationPrompt = [generationPrompt.trim(), preset.prompt].filter(Boolean).join("\n\n");
+            }
+            if (preset.negativePrompt && !generationNegativePrompt.includes(preset.negativePrompt)) {
+                generationNegativePrompt = [generationNegativePrompt.trim(), preset.negativePrompt].filter(Boolean).join(", ");
+            }
+        }
+        generatedImage = null;
+        toast.success(mode === "replace" ? `已使用预设「${preset.name}」` : `已追加预设「${preset.name}」`);
+    }
+
+    async function deleteSelectedPromptPreset() {
+        const preset = generationPromptPresets.find((item) => item.id === selectedPromptPresetId);
+        if (!preset) return;
+        if (!window.confirm(`确定删除提示词预设「${preset.name}」吗？`)) return;
+        isSavingPromptPreset = true;
+        try {
+            await persistImagePromptPresets(generationPromptPresets.filter((item) => item.id !== preset.id));
+            selectedPromptPresetId = "";
+            toast.success(`已删除预设「${preset.name}」`);
+        } catch (e: any) {
+            toast.error("删除预设失败", { description: e?.message || String(e) });
+        } finally {
+            isSavingPromptPreset = false;
+        }
+    }
+
     async function loadCharacterChoices() {
         if (generationCharacters.length) return;
         const choices: CharacterChoice[] = [];
@@ -839,6 +962,7 @@
             if (settingsRes.ok) {
                 const settings = await settingsRes.json();
                 generationChannelId = settings.ai_config_image || "";
+                generationPromptPresets = parseImagePromptPresets(settings.image_prompt_presets);
             }
             await loadCharacterChoices();
         } catch (e) {
@@ -1781,6 +1905,77 @@
                             {promptDraftSource === "appearance" ? "已优先摘出卡内的外貌相关句子。" : "卡内没有明确的外貌段落，已放入角色描述，请生成前删掉无关剧情。"}
                         </p>
                     {/if}
+                </div>
+
+                <div class="space-y-3 rounded-lg border bg-muted/10 p-3">
+                    <div class="flex items-center justify-between gap-3">
+                        <Label for="generation-prompt-preset">提示词预设</Label>
+                        <span class="text-xs text-muted-foreground">{generationPromptPresets.length}/50</span>
+                    </div>
+                    <div class="grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto_auto_auto]">
+                        <select
+                            id="generation-prompt-preset"
+                            class="h-9 min-w-0 rounded-md border bg-background px-3 text-sm"
+                            bind:value={selectedPromptPresetId}
+                            disabled={isSavingPromptPreset}
+                            onchange={() => {
+                                promptPresetName = generationPromptPresets.find((preset) => preset.id === selectedPromptPresetId)?.name || "";
+                            }}
+                        >
+                            <option value="">选择已保存的预设</option>
+                            {#each generationPromptPresets as preset}
+                                <option value={preset.id}>{preset.name}</option>
+                            {/each}
+                        </select>
+                        <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            disabled={!selectedPromptPresetId || isSavingPromptPreset}
+                            onclick={() => applyPromptPreset("append")}
+                        >追加</Button>
+                        <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            disabled={!selectedPromptPresetId || isSavingPromptPreset}
+                            onclick={() => applyPromptPreset("replace")}
+                        >替换</Button>
+                        <Button
+                            type="button"
+                            size="icon"
+                            variant="ghost"
+                            class="h-9 w-9 text-destructive"
+                            aria-label="删除选中的提示词预设"
+                            title="删除选中的预设"
+                            disabled={!selectedPromptPresetId || isSavingPromptPreset}
+                            onclick={deleteSelectedPromptPreset}
+                        >
+                            <Trash2 class="h-4 w-4" />
+                        </Button>
+                    </div>
+                    <div class="flex flex-col gap-2 sm:flex-row">
+                        <Input
+                            bind:value={promptPresetName}
+                            maxlength={60}
+                            placeholder="预设名称（可不填，会自动取名）"
+                            disabled={isSavingPromptPreset}
+                        />
+                        <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            class="shrink-0"
+                            disabled={isSavingPromptPreset || (!generationPrompt.trim() && !generationNegativePrompt.trim())}
+                            onclick={saveCurrentPromptPreset}
+                        >
+                            {#if isSavingPromptPreset}<Loader2 class="mr-2 h-4 w-4 animate-spin" />{/if}
+                            保存当前提示词
+                        </Button>
+                    </div>
+                    <p class="text-xs text-muted-foreground">
+                        会同时保存正向和负向提示词。“追加”适合把固定画风接到角色外貌后，“替换”会覆盖当前内容。
+                    </p>
                 </div>
 
                 <div class="space-y-2">
