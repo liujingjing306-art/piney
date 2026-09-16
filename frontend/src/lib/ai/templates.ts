@@ -223,6 +223,7 @@ Select the appropriate dimension combination based on the request type (Content 
 1.  **JSON Only**: Output must be a standard JSON array format.
 * **Exact Count**: The array must contain exactly the requested number of entries.
 * **Trigger Keys**: Every entry must include a "keys" array with 8–12 useful Simplified Chinese trigger keywords. Prioritize reliable recall: cover the exact name, aliases/abbreviations, common paraphrases, related actions, objects, locations, and phrases a user may naturally type. Vary the count according to the entry instead of mechanically returning the same number for every entry. Avoid duplicates. A single-character key is allowed when it is a common, directly relevant expression (for example, "画" for an illustration entry), but do not pad the list with unrelated generic characters.
+* **Balanced Length**: Keep each entry's content at roughly 700–1200 Simplified Chinese characters so the setting has enough depth. Distribute detail evenly across all requested entries; never spend most of the output budget on the first entry.
 2.  **Strict Structure**: Inside the \\\`content\\\` field, use \\\`【Dimension Name】：\\\` to lead.
 3.  **Density**: Write like a veteran observer. Every sentence must provide new information.
 4.  **Visual Segmentation**: Use \\\`\\\\n\\\\n\\\` (double line breaks) within the \\\`content\\\` field to separate logical paragraphs for excellent readability.
@@ -246,7 +247,7 @@ Select the appropriate dimension combination based on the request type (Content 
 ## Execution
 **Analyze**: Analyze conflicts between \\\`{{user_request}}\\\` and \\\`{{current_world_info}}\\\`.
 **Refine**: Add missing costs, defects, and sensory details appropriate to the era.
-**Generate**: Output JSON data.`;
+**Generate**: Output the JSON array immediately. Do not output your analysis, planning, or any text outside the JSON data.`;
 
 export const GENERATE_OPENING_TEMPLATE = `# Role: Expert Creative Director & RP Writer
 

@@ -10,6 +10,13 @@ export type GeneratedWorldInfoEntry = {
     content: string;
     keys: string[];
 };
+export type GeneratedWorldInfoResult = {
+    entries: GeneratedWorldInfoEntry[];
+    requestedCount: number;
+    complete: boolean;
+    retried: boolean;
+    truncated: boolean;
+};
 
 export class AiService {
     private static activeRequests = 0;
@@ -273,36 +280,68 @@ export class AiService {
         userInput: string,
         currentWorldInfo: string,
         entryCount = 3
-    ): Promise<GeneratedWorldInfoEntry[]> {
+    ): Promise<GeneratedWorldInfoResult> {
         const normalizedEntryCount = Math.min(8, Math.max(1, Math.round(entryCount)));
         const globalPrompt = await this.getGlobalPrompt();
         const feature = AiFeature.GENERATE_WORLD_INFO;
 
-        const variables: any = {
-            user_request: userInput,
-            current_world_info: currentWorldInfo,
-            entry_count: String(normalizedEntryCount),
-            name: "", description: "", personality: "", first_mes: "", creator_notes: ""
-        };
+        const requestEntries = async (request: string, context: string, count: number) => {
+            const variables: any = {
+                user_request: request,
+                current_world_info: context,
+                entry_count: String(count),
+                name: "", description: "", personality: "", first_mes: "", creator_notes: ""
+            };
 
-        const userPrompt = PromptBuilder.buildUserPrompt(feature, variables);
-        const systemPrompt = globalPrompt || "";
+            const userPrompt = PromptBuilder.buildUserPrompt(feature, variables);
+            const messages = [];
+            if (globalPrompt && globalPrompt.trim()) {
+                messages.push({ role: "system", content: globalPrompt });
+            }
+            messages.push({ role: "user", content: userPrompt });
 
-        const messages = [];
-        if (systemPrompt && systemPrompt.trim()) {
-            messages.push({ role: "system", content: systemPrompt });
-        }
-        messages.push({ role: "user", content: userPrompt });
-
-        try {
             const token = localStorage.getItem("auth_token");
             const result = await this.execute(feature, messages, token);
             const { content, truncated } = this.choiceText(result);
-            const entries = parseGeneratedWorldInfo(content, normalizedEntryCount);
-            if (entries.length > 0) return entries;
+            return {
+                entries: parseGeneratedWorldInfo(content, count),
+                truncated,
+            };
+        };
+
+        try {
+            const firstResult = await requestEntries(userInput, currentWorldInfo, normalizedEntryCount);
+            if (firstResult.entries.length === normalizedEntryCount) {
+                return {
+                    entries: firstResult.entries,
+                    requestedCount: normalizedEntryCount,
+                    complete: true,
+                    retried: false,
+                    truncated: firstResult.truncated,
+                };
+            }
+
+            if (firstResult.entries.length > 0) {
+                const missingCount = normalizedEntryCount - firstResult.entries.length;
+                const completedEntrySummary = firstResult.entries
+                    .map((entry) => `- ${entry.comment || "未命名条目"}：${entry.keys.join("、") || "无关键词"}`)
+                    .join("\n");
+                const continuationRequest = `${userInput}\n\n上一次只完成了 ${firstResult.entries.length}/${normalizedEntryCount} 条。现在只生成缺少的 ${missingCount} 条，不要重复已经完成的条目，并仍然只返回包含 ${missingCount} 个对象的 JSON 数组。`;
+                const continuationContext = `${currentWorldInfo}\n\n【本次已经完成、禁止重复的条目】\n${completedEntrySummary}`;
+                const secondResult = await requestEntries(continuationRequest, continuationContext, missingCount);
+                const entries = [...firstResult.entries, ...secondResult.entries].slice(0, normalizedEntryCount);
+
+                return {
+                    entries,
+                    requestedCount: normalizedEntryCount,
+                    complete: entries.length === normalizedEntryCount,
+                    retried: true,
+                    truncated: firstResult.truncated || secondResult.truncated,
+                };
+            }
 
             throw new Error(
-                truncated
+                firstResult.truncated
                     ? "模型输出被截断，且没有形成完整条目；请减少生成条数后重试"
                     : "模型没有按世界书格式返回内容；请换个模型或调整关键词后重试"
             );

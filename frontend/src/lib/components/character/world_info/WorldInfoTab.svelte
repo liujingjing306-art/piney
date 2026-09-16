@@ -612,11 +612,12 @@
                 Boolean(currentCharacterContext),
                 Boolean(currentWorldInfo),
             );
-            const newEntriesData = await AiService.generateWorldInfo(
+            const generationResult = await AiService.generateWorldInfo(
                 request,
                 generationContext || "（当前世界书暂无条目）",
                 count,
             );
+            const newEntriesData = generationResult.entries;
 
             if (newEntriesData.length > 0) {
                 generatedDrafts = newEntriesData.map((item, index) => ({
@@ -629,8 +630,16 @@
                     toast.warning(
                         `生成内容有 ${generatedBrokenUnicodeCount} 处损坏字符，已标出；请修改或重新生成`,
                     );
+                } else if (!generationResult.complete) {
+                    toast.warning(
+                        `要求生成 ${generationResult.requestedCount} 条，自动补生成后仍只有 ${generatedDrafts.length} 条；已保留可用结果，可以重试`,
+                    );
                 } else {
-                    toast.success(`生成了 ${generatedDrafts.length} 条，确认后再加入世界书`);
+                    toast.success(
+                        generationResult.retried
+                            ? `首次返回不完整，已自动补齐 ${generatedDrafts.length} 条；确认后再加入世界书`
+                            : `生成了 ${generatedDrafts.length} 条，确认后再加入世界书`,
+                    );
                 }
             } else {
                 toast.error("AI 没有返回可用条目，请换个关键词重试");
