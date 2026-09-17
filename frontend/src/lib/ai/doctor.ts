@@ -5,6 +5,17 @@ import { API_BASE } from '$lib/api';
 
 export interface DoctorReport {
     core_assessment: string;
+    greeting_diagnostics?: Array<{
+        label: string;
+        status: string;
+        issues: string;
+        suggestions: string;
+    }>;
+    greeting_coverage?: {
+        expected: number;
+        covered: number;
+        missing: string[];
+    };
     dimensions: Array<{
         name: string;
         status: string;
@@ -45,19 +56,28 @@ const controllers = new Map<string, AbortController>();
 
 // --- Actions ---
 
-export function startDiagnosis(cardId: string) {
+interface DiagnosisOptions {
+    existingReport?: DoctorReport;
+    missingGreetingLabels?: string[];
+}
+
+export function startDiagnosis(cardId: string, options: DiagnosisOptions = {}) {
     const current = get(doctorTasks)[cardId];
     if (current?.status === 'analyzing') {
         return;
     }
+
+    const missingGreetingLabels = options.missingGreetingLabels?.filter(Boolean) ?? [];
+    const isGreetingCompletion = Boolean(options.existingReport && missingGreetingLabels.length > 0);
+    const reportToPreserve = isGreetingCompletion ? options.existingReport ?? null : null;
 
     // Reset State
     doctorTasks.update(s => ({
         ...s,
         [cardId]: {
             status: 'analyzing',
-            message: '初始化诊断连接...',
-            report: null
+            message: isGreetingCompletion ? '准备补全遗漏的开场白诊断...' : '初始化诊断连接...',
+            report: reportToPreserve
         }
     }));
 
@@ -78,7 +98,13 @@ export function startDiagnosis(cardId: string) {
             'Content-Type': 'application/json',
             ...(token ? { 'Authorization': `Bearer ${token}` } : {})
         },
-        body: JSON.stringify({ card_id: cardId }),
+        body: JSON.stringify({
+            card_id: cardId,
+            ...(isGreetingCompletion ? {
+                existing_report: options.existingReport,
+                missing_greeting_labels: missingGreetingLabels
+            } : {})
+        }),
         signal: controller.signal
     })
         .then(async (response) => {
@@ -166,19 +192,32 @@ export function startDiagnosis(cardId: string) {
         })
         .catch((error) => {
             if (error.name !== 'AbortError') {
-                doctorTasks.update(s => ({
-                    ...s,
-                    [cardId]: {
-                        status: 'error',
-                        message: error.message || '网络连接中断',
-                        report: null
-                    }
-                }));
+                doctorTasks.update(s => {
+                    const state = s[cardId];
+                    return {
+                        ...s,
+                        [cardId]: {
+                            ...state,
+                            status: 'error',
+                            message: error.message || '网络连接中断',
+                            report: state?.report ?? reportToPreserve
+                        }
+                    };
+                });
             }
         })
         .finally(() => {
             controllers.delete(cardId);
         });
+}
+
+export function completeGreetingDiagnosis(cardId: string, report: DoctorReport) {
+    const missingGreetingLabels = report.greeting_coverage?.missing ?? [];
+    if (missingGreetingLabels.length === 0) return;
+    startDiagnosis(cardId, {
+        existingReport: report,
+        missingGreetingLabels
+    });
 }
 
 export function stopDiagnosis(cardId: string) {
@@ -189,10 +228,17 @@ export function stopDiagnosis(cardId: string) {
         } catch {
         }
         controllers.delete(cardId);
-        doctorTasks.update(s => ({
-            ...s,
-            [cardId]: { ...s[cardId], status: 'idle', message: '已停止' }
-        }));
+        doctorTasks.update(s => {
+            const state = s[cardId];
+            return {
+                ...s,
+                [cardId]: {
+                    ...state,
+                    status: state?.report ? 'complete' : 'idle',
+                    message: '已停止'
+                }
+            };
+        });
     }
 }
 

@@ -1308,15 +1308,129 @@ use axum::response::sse::{Event, Sse};
 use futures::stream::{self, Stream};
 use std::convert::Infallible;
 
-const DOCTOR_MAX_ENTRY_ROUNDS: usize = 6;
+const DOCTOR_MAX_ENTRY_ROUNDS: usize = 8;
 const DOCTOR_MAX_ENTRIES_PER_ROUND: usize = 6;
-const DOCTOR_GREETING_CHARS: usize = 4000;
-const DOCTOR_MAX_ALT_GREETINGS: usize = 20;
-const DOCTOR_MAX_OUTPUT_TOKENS: usize = 12_288;
+const DOCTOR_GREETING_TOTAL_CHARS: usize = 80_000;
+const DOCTOR_GREETING_MIN_CHARS: usize = 500;
+const DOCTOR_GREETING_MAX_CHARS: usize = 8_000;
+const DOCTOR_MAX_OUTPUT_TOKENS: usize = 16_384;
+
+fn collect_doctor_greetings<'a>(
+    first_mes: &'a str,
+    alt_greetings: &[&'a str],
+) -> Vec<(String, &'a str)> {
+    let mut greetings: Vec<(String, &str)> = Vec::new();
+    if !first_mes.trim().is_empty() {
+        greetings.push(("主开场白".to_string(), first_mes));
+    }
+    for (idx, greeting) in alt_greetings.iter().enumerate() {
+        if !greeting.trim().is_empty() {
+            greetings.push((format!("备用开场白 #{}", idx + 1), greeting));
+        }
+    }
+    greetings
+}
+
+fn render_doctor_greeting_context(greetings: &[(String, &str)]) -> String {
+    let per_greeting_char_limit = if greetings.is_empty() {
+        0
+    } else {
+        (DOCTOR_GREETING_TOTAL_CHARS / greetings.len())
+            .clamp(DOCTOR_GREETING_MIN_CHARS, DOCTOR_GREETING_MAX_CHARS)
+    };
+    if greetings.is_empty() {
+        "（没有非空开场白）".to_string()
+    } else {
+        greetings
+            .iter()
+            .map(|(label, greeting)| {
+                let mut clipped: String = greeting.chars().take(per_greeting_char_limit).collect();
+                if greeting.chars().count() > per_greeting_char_limit {
+                    clipped.push_str("\n（此条过长，已截取前段；诊断时请明确标注截取情况）");
+                }
+                format!("[{}]\n{}", label, clipped)
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n")
+    }
+}
+
+fn build_doctor_greeting_context(first_mes: &str, alt_greetings: &[&str]) -> (Vec<String>, String) {
+    let greetings = collect_doctor_greetings(first_mes, alt_greetings);
+    let labels = greetings
+        .iter()
+        .map(|(label, _)| label.clone())
+        .collect::<Vec<_>>();
+    let context = render_doctor_greeting_context(&greetings);
+
+    (labels, context)
+}
+
+fn build_doctor_selected_greeting_context(
+    first_mes: &str,
+    alt_greetings: &[&str],
+    selected_labels: &[String],
+) -> String {
+    let selected_label_set: std::collections::HashSet<&str> =
+        selected_labels.iter().map(String::as_str).collect();
+    let greetings = collect_doctor_greetings(first_mes, alt_greetings)
+        .into_iter()
+        .filter(|(label, _)| selected_label_set.contains(label.as_str()))
+        .collect::<Vec<_>>();
+    render_doctor_greeting_context(&greetings)
+}
+
+fn merge_doctor_greeting_completion(
+    existing_report: &Value,
+    generated_report: &Value,
+    completion_labels: &[String],
+) -> Value {
+    let mut merged_report = existing_report.clone();
+    let completion_label_set: std::collections::HashSet<&str> =
+        completion_labels.iter().map(String::as_str).collect();
+    let generated_diagnostics = generated_report
+        .get("greeting_diagnostics")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    if let Some(merged_object) = merged_report.as_object_mut() {
+        let merged_diagnostics = merged_object
+            .entry("greeting_diagnostics")
+            .or_insert_with(|| serde_json::json!([]));
+        if !merged_diagnostics.is_array() {
+            *merged_diagnostics = serde_json::json!([]);
+        }
+        if let Some(items) = merged_diagnostics.as_array_mut() {
+            for diagnostic in generated_diagnostics {
+                let Some(label) = diagnostic
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                else {
+                    continue;
+                };
+                if !completion_label_set.contains(label) {
+                    continue;
+                }
+                items.retain(|item| {
+                    item.get("label").and_then(Value::as_str).map(str::trim) != Some(label)
+                });
+                items.push(diagnostic);
+            }
+        }
+    }
+
+    merged_report
+}
 
 #[derive(Deserialize)]
 pub struct DoctorAnalyzeRequest {
     pub card_id: Uuid,
+    #[serde(default)]
+    pub existing_report: Option<Value>,
+    #[serde(default)]
+    pub missing_greeting_labels: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -1343,7 +1457,11 @@ pub async fn doctor_analyze(
     State(db): State<DatabaseConnection>,
     Json(payload): Json<DoctorAnalyzeRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<Value>)> {
-    let card_id = payload.card_id;
+    let DoctorAnalyzeRequest {
+        card_id,
+        existing_report,
+        missing_greeting_labels: requested_missing_greeting_labels,
+    } = payload;
 
     // 检查是否有正在运行的任务
     let running_task = doctor_task::Entity::find()
@@ -1480,46 +1598,39 @@ pub async fn doctor_analyze(
             .join("\n")
     };
 
-    // 判断开场白是否需要诊断（排除代码或极短内容）
-    fn should_include_greeting(content: &str) -> bool {
-        content.len() > 20
-            && !content.trim().starts_with('<')
-            && !content.trim().starts_with('{')
-            && !content.trim().starts_with('[')
-    }
+    // 所有非空开场白都需要诊断。正常文本经常以 {{char}}、[场景] 或 HTML
+    // 排版开头，不能再根据第一个字符把它误判为代码。数量很多时平均分配
+    // 输入预算，但仍保留每一条的原始编号并至少读取前段。
+    let (expected_greeting_labels, greeting_notes) =
+        build_doctor_greeting_context(first_mes, &alt_greetings);
 
-    fn clip_greeting(content: &str) -> String {
-        let mut out: String = content.chars().take(DOCTOR_GREETING_CHARS).collect();
-        if content.chars().count() > DOCTOR_GREETING_CHARS {
-            out.push_str("...");
-        }
-        out
-    }
-
-    let mut greeting_notes = Vec::new();
-    if should_include_greeting(first_mes) {
-        greeting_notes.push(format!("- 首条消息：{}", clip_greeting(first_mes)));
-    } else {
-        greeting_notes.push("- 首条消息：（内容过短或为代码，跳过诊断）".to_string());
-    }
-
-    let usable_alt_greetings: Vec<&str> = alt_greetings
-        .into_iter()
-        .filter(|content| should_include_greeting(content))
-        .take(DOCTOR_MAX_ALT_GREETINGS)
+    // 补全只能由前端显式请求。服务端重新按角色卡中的真实标签过滤，避免客户端
+    // 注入任意标签；没有现有报告时则始终按普通完整诊断处理。
+    let requested_missing_label_set: std::collections::HashSet<String> =
+        requested_missing_greeting_labels.into_iter().collect();
+    let completion_requested = existing_report.is_some() || !requested_missing_label_set.is_empty();
+    let missing_greeting_labels_to_complete: Vec<String> = expected_greeting_labels
+        .iter()
+        .filter(|label| requested_missing_label_set.contains(label.as_str()))
+        .cloned()
         .collect();
-    if usable_alt_greetings.is_empty() {
-        greeting_notes.push("- 其他开场白：（没有可诊断内容，或内容过短/为代码）".to_string());
-    } else {
-        for (idx, greeting) in usable_alt_greetings.iter().enumerate() {
-            greeting_notes.push(format!(
-                "- 其他开场白（第{}个）：{}",
-                idx + 1,
-                clip_greeting(greeting)
+    let greeting_completion = if completion_requested {
+        let Some(existing_report) = existing_report.filter(Value::is_object) else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "补全请求缺少有效的现有报告"})),
+            ));
+        };
+        if missing_greeting_labels_to_complete.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "待补全的开场白已不存在，请重新诊断"})),
             ));
         }
-    }
-    let greeting_notes = greeting_notes.join("\n");
+        Some((existing_report, missing_greeting_labels_to_complete))
+    } else {
+        None
+    };
 
     // 构建 System Prompt (包含分析豁免声明)
     let system_prompt = format!(
@@ -1543,7 +1654,7 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
 **诊断重点：**
 - 专注于分析角色设定的逻辑一致性、人设合理性、对话质量
 - 不要诊断角色卡的格式问题（如标签格式、代码块使用等技术规范）
-- 开场白（first_mes 和其他开场白）是诊断的重要内容。用户可能配置多条 alternate_greetings；如果已提供多条，请综合比较，不要只诊断第一条。
+- 开场白（first_mes 和其他开场白）是诊断的重要内容。你必须按清单顺序为每个标签分别返回一项 greeting_diagnostics，label 必须逐字复制输入标签，不得合并、改名、重复或遗漏；之后再在“开场白诊断”维度中综合比较。若清单为空，greeting_diagnostics 必须是空数组。
 - **权重说明：** 核心设定（Name, Description, Personality）具有最高权重。世界书内容仅作为次要权重，但两者都很重要，都需要作为诊断的依据。
 
 **请求条目格式（严格 JSON，无代码块标记）：**
@@ -1554,6 +1665,10 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
 **诊断报告格式（严格 JSON，无代码块标记）：**
 {{"action": "final_report", "report": {{
   "core_assessment": "概括性描述角色卡的完成质量与逻辑成熟度",
+  "greeting_diagnostics": [
+    {{"label": "主开场白", "status": "这条开场白的具体表现", "issues": "这条独有的问题或无", "suggestions": "针对这条的修改建议或无"}},
+    {{"label": "备用开场白 #1", "status": "逐条诊断，不得合并", "issues": "潜在问题", "suggestions": "优化建议"}}
+  ],
   "dimensions": [
     {{"name": "设定诊断", "status": "现状描述", "issues": "潜在问题", "suggestions": "优化建议"}},
     {{"name": "开场白诊断", "status": "现状描述", "issues": "潜在问题", "suggestions": "优化建议"}},
@@ -1569,14 +1684,39 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
         global_prompt, DOCTOR_MAX_ENTRIES_PER_ROUND
     );
 
-    // 构建初始 User Message
-    let initial_user_msg = format!(
-        r#"**[任务启动]** 请审阅以下内容，并返回你第一轮想要阅读的世界书条目名称（JSON 格式）。
+    // 构建初始 User Message。补全模式是用户点击确认后才进入的单次调用，
+    // 只要求模型补缺失项，返回后由服务端合并回现有报告。
+    let initial_user_msg = if let Some((existing_report, missing_labels)) = &greeting_completion {
+        format!(
+            r#"**[用户已确认：补全遗漏的开场白诊断]**
+
+这是一次单独的补全调用。不要重新诊断整份角色卡，不要申请世界书条目，只分析下列缺失标签：
+{}
+
+**开场白原文（只需为上述缺失标签产出诊断）：**
+{}
+
+**现有报告（仅供保持措辞与判断尺度一致；系统会负责合并，请勿重写其他字段）：**
+{}
+
+请只返回以下纯 JSON，不要包含其他文字：
+{{"action":"final_report","report":{{"greeting_diagnostics":[{{"label":"缺失标签原文","status":"当前表现","issues":"问题或无","suggestions":"建议或无"}}]}}}}
+
+greeting_diagnostics 必须且只能包含上述缺失标签，每个 label 原样出现一次。"#,
+            serde_json::to_string(missing_labels).unwrap_or_default(),
+            build_doctor_selected_greeting_context(first_mes, &alt_greetings, missing_labels),
+            serde_json::to_string(existing_report).unwrap_or_default(),
+        )
+    } else {
+        format!(
+            r#"**[任务启动]** 请审阅以下内容，并返回你第一轮想要阅读的世界书条目名称（JSON 格式）。
 
 **核心设定：**
 - 角色名称：{}
 - 角色描述：{}
 - 性格特征：{}
+
+**开场白清单（共 {} 条；以下每个标签都必须在 greeting_diagnostics 中原样出现一次）：**
 {}
 
 **世界书目录（条目名称列表）：**
@@ -1584,8 +1724,14 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
 
 请返回 JSON 格式：{{"action": "request_entries", "entries": ["条目名1", ...]}}
 如果世界书目录为空或无需阅读条目，请直接输出诊断报告 JSON。请优先判断当前信息是否足够，避免不必要的搜索。同时请严格避开 NSFW 相关条目。"#,
-        name, description, personality, greeting_notes, worldbook_toc_str
-    );
+            name,
+            description,
+            personality,
+            expected_greeting_labels.len(),
+            greeting_notes,
+            worldbook_toc_str
+        )
+    };
 
     // 克隆需要的数据到 async 块
     let db_clone = db.clone();
@@ -1604,8 +1750,19 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
                 serde_json::json!({"role": "user", "content": initial_user_msg}),
             ],
             0usize, // iteration count
+            expected_greeting_labels,
+            greeting_completion,
         ),
-        |(db, card_id, channel, entries, mut messages, iteration)| async move {
+        |(
+            db,
+            card_id,
+            channel,
+            entries,
+            mut messages,
+            iteration,
+            expected_greeting_labels,
+            greeting_completion,
+        )| async move {
             let sent_messages = messages.clone(); // Capture state before mutation for debug logging
 
             // 发送进度事件
@@ -1652,7 +1809,19 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
                         })
                         .unwrap(),
                     );
-                    return Some((Ok(event), (db, card_id, channel, entries, messages, 999)));
+                    return Some((
+                        Ok(event),
+                        (
+                            db,
+                            card_id,
+                            channel,
+                            entries,
+                            messages,
+                            999,
+                            expected_greeting_labels,
+                            greeting_completion,
+                        ),
+                    ));
                 }
             };
 
@@ -1677,7 +1846,19 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
                     })
                     .unwrap(),
                 );
-                return Some((Ok(event), (db, card_id, channel, entries, messages, 999)));
+                return Some((
+                    Ok(event),
+                    (
+                        db,
+                        card_id,
+                        channel,
+                        entries,
+                        messages,
+                        999,
+                        expected_greeting_labels,
+                        greeting_completion,
+                    ),
+                ));
             }
 
             let json: Value = match serde_json::from_str(&raw_text) {
@@ -1697,7 +1878,19 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
                         })
                         .unwrap(),
                     );
-                    return Some((Ok(event), (db, card_id, channel, entries, messages, 999)));
+                    return Some((
+                        Ok(event),
+                        (
+                            db,
+                            card_id,
+                            channel,
+                            entries,
+                            messages,
+                            999,
+                            expected_greeting_labels,
+                            greeting_completion,
+                        ),
+                    ));
                 }
             };
 
@@ -1725,7 +1918,19 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
                     })
                     .unwrap(),
                 );
-                return Some((Ok(event), (db, card_id, channel, entries, messages, 999)));
+                return Some((
+                    Ok(event),
+                    (
+                        db,
+                        card_id,
+                        channel,
+                        entries,
+                        messages,
+                        999,
+                        expected_greeting_labels,
+                        greeting_completion,
+                    ),
+                ));
             }
 
             // 智能提取 JSON 部分（寻找最外层的 {}，忽略前后的废话）
@@ -1762,7 +1967,10 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
                 .and_then(|a| a.as_str())
                 .unwrap_or("final_report");
 
-            if action == "request_entries" && iteration < DOCTOR_MAX_ENTRY_ROUNDS {
+            if action == "request_entries"
+                && greeting_completion.is_none()
+                && iteration < DOCTOR_MAX_ENTRY_ROUNDS
+            {
                 // AI 请求更多条目
                 let requested: Vec<String> = ai_response
                     .get("entries")
@@ -1850,14 +2058,83 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
 
                 Some((
                     Ok(event),
-                    (db, card_id, channel, entries, messages, iteration + 1),
+                    (
+                        db,
+                        card_id,
+                        channel,
+                        entries,
+                        messages,
+                        iteration + 1,
+                        expected_greeting_labels,
+                        greeting_completion,
+                    ),
                 ))
             } else {
                 // 最终报告
-                let report = ai_response
+                let generated_report = ai_response
                     .get("report")
                     .cloned()
                     .unwrap_or(ai_response.clone());
+
+                let mut report =
+                    if let Some((existing_report, completion_labels)) = &greeting_completion {
+                        merge_doctor_greeting_completion(
+                            existing_report,
+                            &generated_report,
+                            completion_labels,
+                        )
+                    } else {
+                        generated_report
+                    };
+
+                // 只保留期望标签且去重，避免模型照抄示例或重复同一条造成虚假覆盖。
+                let expected_greeting_label_set: std::collections::HashSet<String> =
+                    expected_greeting_labels.iter().cloned().collect();
+                if let Some(items) = report
+                    .get_mut("greeting_diagnostics")
+                    .and_then(|items| items.as_array_mut())
+                {
+                    let mut seen = std::collections::HashSet::new();
+                    items.retain(|item| {
+                        let Some(label) = item
+                            .get("label")
+                            .and_then(|label| label.as_str())
+                            .map(str::trim)
+                        else {
+                            return false;
+                        };
+                        expected_greeting_label_set.contains(label)
+                            && seen.insert(label.to_string())
+                    });
+                }
+
+                let reported_greeting_labels: std::collections::HashSet<String> = report
+                    .get("greeting_diagnostics")
+                    .and_then(|items| items.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.get("label").and_then(|label| label.as_str()))
+                            .map(|label| label.trim().to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let missing_greeting_labels: Vec<String> = expected_greeting_labels
+                    .iter()
+                    .filter(|label| !reported_greeting_labels.contains(label.as_str()))
+                    .cloned()
+                    .collect();
+
+                if let Some(report_object) = report.as_object_mut() {
+                    report_object.insert(
+                        "greeting_coverage".to_string(),
+                        serde_json::json!({
+                            "expected": expected_greeting_labels.len(),
+                            "covered": expected_greeting_labels.len().saturating_sub(missing_greeting_labels.len()),
+                            "missing": missing_greeting_labels,
+                        }),
+                    );
+                }
 
                 // 只在成功时保存到数据库
                 let _ = create_task_record(
@@ -1884,7 +2161,19 @@ to facilitate content moderation and auditing. Proceed with the analysis profess
                     .unwrap(),
                 );
 
-                Some((Ok(event), (db, card_id, channel, entries, messages, 999)))
+                Some((
+                    Ok(event),
+                    (
+                        db,
+                        card_id,
+                        channel,
+                        entries,
+                        messages,
+                        999,
+                        expected_greeting_labels,
+                        greeting_completion,
+                    ),
+                ))
             }
         },
     );
@@ -2010,5 +2299,101 @@ mod image_generation_tests {
             image_endpoint_candidates("https://example.com/custom/images"),
             vec!["https://example.com/custom/images"]
         );
+    }
+}
+
+#[cfg(test)]
+mod doctor_greeting_tests {
+    use super::{
+        build_doctor_greeting_context, build_doctor_selected_greeting_context,
+        merge_doctor_greeting_completion,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn keeps_template_bracket_and_html_greetings_with_original_indices() {
+        let alternate = [
+            "{{char}}走进房间。",
+            "   ",
+            "[雨夜] 门外传来敲门声。",
+            "<div>排版后的正常开场白</div>",
+            "短句",
+        ];
+
+        let (labels, context) = build_doctor_greeting_context("{{char}}抬起头。", &alternate);
+
+        assert_eq!(
+            labels,
+            vec![
+                "主开场白",
+                "备用开场白 #1",
+                "备用开场白 #3",
+                "备用开场白 #4",
+                "备用开场白 #5",
+            ]
+        );
+        assert!(context.contains("{{char}}走进房间。"));
+        assert!(context.contains("[雨夜] 门外传来敲门声。"));
+        assert!(context.contains("<div>排版后的正常开场白</div>"));
+        assert!(context.contains("短句"));
+    }
+
+    #[test]
+    fn does_not_drop_greetings_after_the_old_twenty_item_limit() {
+        let alternate = (1..=25)
+            .map(|idx| format!("备用开场白内容 {}", idx))
+            .collect::<Vec<_>>();
+        let alternate_refs = alternate.iter().map(String::as_str).collect::<Vec<_>>();
+
+        let (labels, context) = build_doctor_greeting_context("", &alternate_refs);
+
+        assert_eq!(labels.len(), 25);
+        assert_eq!(labels.last().map(String::as_str), Some("备用开场白 #25"));
+        assert!(context.contains("备用开场白内容 25"));
+    }
+
+    #[test]
+    fn completion_context_contains_only_confirmed_missing_greetings() {
+        let alternate = ["第一条", "第二条", "第三条"];
+        let selected = vec!["备用开场白 #2".to_string()];
+
+        let context = build_doctor_selected_greeting_context("主开场白", &alternate, &selected);
+
+        assert!(context.contains("[备用开场白 #2]\n第二条"));
+        assert!(!context.contains("主开场白\n"));
+        assert!(!context.contains("第一条"));
+        assert!(!context.contains("第三条"));
+    }
+
+    #[test]
+    fn completion_merges_only_confirmed_labels_into_existing_report() {
+        let existing = json!({
+            "core_assessment": "保留原报告",
+            "greeting_diagnostics": [
+                {"label": "主开场白", "status": "原有", "issues": "无", "suggestions": "无"}
+            ],
+            "dimensions": [],
+            "prescriptions": [],
+            "conclusion": "通过"
+        });
+        let generated = json!({
+            "greeting_diagnostics": [
+                {"label": "备用开场白 #2", "status": "已补全", "issues": "无", "suggestions": "无"},
+                {"label": "备用开场白 #3", "status": "不应合并", "issues": "无", "suggestions": "无"}
+            ]
+        });
+
+        let merged =
+            merge_doctor_greeting_completion(&existing, &generated, &["备用开场白 #2".to_string()]);
+        let diagnostics = merged["greeting_diagnostics"].as_array().unwrap();
+
+        assert_eq!(merged["core_assessment"], "保留原报告");
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics
+            .iter()
+            .any(|item| item["label"] == "备用开场白 #2" && item["status"] == "已补全"));
+        assert!(!diagnostics
+            .iter()
+            .any(|item| item["label"] == "备用开场白 #3"));
     }
 }

@@ -22,6 +22,7 @@
     import { cn } from "$lib/utils";
     import {
         startDiagnosis,
+        completeGreetingDiagnosis,
         stopDiagnosis,
         getDoctorHistory,
         deleteDoctorHistory,
@@ -103,6 +104,11 @@
         startDiagnosis(cardId);
     }
 
+    function handleCompleteGreetings(report: DoctorReport) {
+        activeTab = 'current';
+        completeGreetingDiagnosis(cardId, report);
+    }
+
     function handleCancel() {
         stopDiagnosis(cardId);
     }
@@ -154,6 +160,76 @@
                 {@html renderMarkdown(report.core_assessment)}
             </div>
         </div>
+
+        <!-- 逐条开场白诊断 -->
+        {#if (report.greeting_diagnostics?.length ?? 0) > 0 || (report.greeting_coverage?.expected ?? 0) > 0}
+            <div class="space-y-4">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                    <h3 class="text-base font-semibold flex items-center gap-2">
+                        <FileText class="h-5 w-5 text-primary" />
+                        开场白逐条诊断
+                    </h3>
+                    {#if report.greeting_coverage}
+                        <Badge
+                            variant="outline"
+                            class={report.greeting_coverage.covered === report.greeting_coverage.expected
+                                ? "border-green-500/30 text-green-600"
+                                : "border-amber-500/30 text-amber-600"}
+                        >
+                            已覆盖 {report.greeting_coverage.covered}/{report.greeting_coverage.expected}
+                        </Badge>
+                    {/if}
+                </div>
+
+                {#if report.greeting_coverage?.missing?.length}
+                    <div class="flex flex-col gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-900 dark:text-amber-100 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                            <div><strong>仍未覆盖：</strong>{report.greeting_coverage.missing.join("、")}</div>
+                            <div class="mt-1 text-xs opacity-80">补全会再次调用一次 AI，只处理这些遗漏项。</div>
+                        </div>
+                        <Button
+                            type="button"
+                            size="sm"
+                            variant="outline"
+                            class="shrink-0 bg-background/70"
+                            disabled={isTaskRunning}
+                            onclick={() => handleCompleteGreetings(report)}
+                        >
+                            {#if isTaskRunning}
+                                <Loader2 class="h-3.5 w-3.5 animate-spin" />
+                            {/if}
+                            补全遗漏（会再次调用 AI）
+                        </Button>
+                    </div>
+                {/if}
+
+                <div class="grid gap-3 md:grid-cols-2">
+                    {#each report.greeting_diagnostics ?? [] as greeting}
+                        <div class="rounded-xl border bg-card p-4 shadow-sm">
+                            <div class="mb-3 font-semibold border-l-4 border-primary pl-2">{greeting.label}</div>
+                            <div class="space-y-3 text-sm">
+                                <div class="rounded-lg border border-blue-500/10 bg-blue-500/5 p-3">
+                                    <span class="mb-1 block text-xs font-semibold text-blue-600/80">当前表现</span>
+                                    <div class="md-content text-foreground/90">{@html renderMarkdown(greeting.status)}</div>
+                                </div>
+                                {#if greeting.issues && greeting.issues !== "无"}
+                                    <div class="rounded-lg border border-amber-500/20 bg-amber-500/10 p-3">
+                                        <span class="mb-1 block text-xs font-semibold text-amber-600">发现问题</span>
+                                        <div class="md-content text-amber-900 dark:text-amber-100">{@html renderMarkdown(greeting.issues)}</div>
+                                    </div>
+                                {/if}
+                                {#if greeting.suggestions && greeting.suggestions !== "无"}
+                                    <div class="rounded-lg border border-green-500/20 bg-green-500/10 p-3">
+                                        <span class="mb-1 block text-xs font-semibold text-green-600">优化建议</span>
+                                        <div class="md-content text-green-900 dark:text-green-100">{@html renderMarkdown(greeting.suggestions)}</div>
+                                    </div>
+                                {/if}
+                            </div>
+                        </div>
+                    {/each}
+                </div>
+            </div>
+        {/if}
 
         <!-- 详细维度 -->
         <div class="space-y-4">
@@ -312,10 +388,19 @@
                         </Button>
                     </div>
 
-                {:else if activeTask.status === 'complete' && activeTask.report}
+                {:else if activeTask.report}
                     <!-- Result View (Using ScrollArea) -->
                     <ScrollArea class="flex-1 h-full"> 
                          <div class="p-6">
+                            {#if activeTask.status === 'error'}
+                                <div class="mb-4 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+                                    <AlertCircle class="mt-0.5 h-4 w-4 shrink-0" />
+                                    <div>
+                                        <div class="font-medium">补全失败，原报告已保留</div>
+                                        <div class="mt-1 opacity-80">{activeTask.message}</div>
+                                    </div>
+                                </div>
+                            {/if}
                             {@render ReportContent(activeTask.report)}
                             <div class="pt-4 text-center">
                                 <Button size="lg" onclick={handleStartDiagnosis} variant="outline" class="gap-2">
